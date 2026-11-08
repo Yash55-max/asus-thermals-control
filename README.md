@@ -149,6 +149,8 @@ If the privilege helper is not installed, the application will display a standar
 3. Click **Save settings**.
 4. When temperatures exceed the threshold, a notification is dispatched. The alert re-arms automatically once the sensor cools at least 5°C below the threshold.
 
+![Desktop Temperature Alert Notification](assets/thermals-alert-notification.png)
+
 ---
 
 ## Configuration

@@ -78,7 +78,8 @@ sudo sensors-detect --auto
 Clone or download this repository, navigate to the folder, and execute the installation script:
 
 ```bash
-cd thermals-app
+git clone https://github.com/Yash55-max/asus-thermals-control.git
+cd asus-thermals-control
 bash install-thermals.sh
 ```
 
@@ -176,7 +177,7 @@ Settings are stored in JSON format at:
 ### Project Structure
 
 ```
-thermals-app/
+asus-thermals-control/
 ├── app.py                  # Core application (Tkinter UI, telemetry collector, logic)
 ├── asus-thermal-profile    # Scoped shell helper for writing platform_profile sysfs node
 ├── install-helper.sh       # Installs the scoped helper into sudoers for passwordless use

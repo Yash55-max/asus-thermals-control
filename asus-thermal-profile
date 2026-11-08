@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Root-owned allowlisted helper. It writes only the Linux platform_profile sysfs node.
+set -euo pipefail
+PROFILE="${1:-}"
+PROFILE_PATH="/sys/firmware/acpi/platform_profile"
+CHOICES_PATH="/sys/firmware/acpi/platform_profile_choices"
+
+case "$PROFILE" in
+  quiet|balanced|performance) ;;
+  *) echo "Invalid profile. Allowed: quiet, balanced, performance." >&2; exit 2 ;;
+esac
+
+[[ -w "$PROFILE_PATH" ]] || { echo "Platform profile interface is not writable." >&2; exit 1; }
+grep -qw -- "$PROFILE" "$CHOICES_PATH" || { echo "Profile is not supported by this firmware." >&2; exit 1; }
+printf '%s\n' "$PROFILE" > "$PROFILE_PATH"
+printf 'Active profile: '
+cat "$PROFILE_PATH"

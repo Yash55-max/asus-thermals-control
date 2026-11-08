@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 APP_NAME = "Thermals"
+__version__ = "1.0.0"
 PROFILE_PATH = Path("/sys/firmware/acpi/platform_profile")
 PROFILE_CHOICES_PATH = Path("/sys/firmware/acpi/platform_profile_choices")
 HW_MON_PATH = Path("/sys/class/hwmon")

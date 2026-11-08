@@ -73,7 +73,15 @@ sudo sensors-detect --auto
 
 ## Installation
 
-### 1. Install the Desktop Application
+### Option A: Install via Debian Package (.deb)
+
+Download the latest release package from the [GitHub Releases](https://github.com/Yash55-max/asus-thermals-control/releases) page:
+
+```bash
+sudo apt install ./asus-thermals-control_1.0.0_all.deb
+```
+
+### Option B: Install from Source
 
 Clone or download this repository, navigate to the folder, and execute the installation script:
 
@@ -182,6 +190,7 @@ asus-thermals-control/
 ├── asus-thermal-profile    # Scoped shell helper for writing platform_profile sysfs node
 ├── install-helper.sh       # Installs the scoped helper into sudoers for passwordless use
 ├── install-thermals.sh     # Installs the desktop application and .desktop file
+├── package.sh              # Packaging script for .deb and source distribution tarball
 ├── run.sh                  # Direct runner script for source execution
 ├── assets/                 # Application screenshots and visual assets
 └── README.md               # Documentation

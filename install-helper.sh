@@ -4,8 +4,13 @@
 set -euo pipefail
 
 TARGET_USER="${SUDO_USER:-${USER:-}}"
+if [[ -z "$TARGET_USER" ]]; then
+  TARGET_USER="$(id -un 2>/dev/null || whoami 2>/dev/null || echo "")"
+fi
+
 if [[ -z "$TARGET_USER" || "$TARGET_USER" == "root" ]]; then
-  echo "Run this script as your normal desktop user: bash install-helper.sh"
+  echo "Please run this script as your normal desktop user: bash install-helper.sh"
+  echo "Or specify user: SUDO_USER=username bash install-helper.sh"
   exit 1
 fi
 
@@ -19,17 +24,31 @@ if [[ ! -f "$HELPER_SOURCE" ]]; then
   exit 1
 fi
 
+echo "Installing privileged profile helper to $HELPER_DEST..."
+sudo install -d -m 0755 "/usr/local/sbin"
 sudo install -o root -g root -m 0755 "$HELPER_SOURCE" "$HELPER_DEST"
-printf '%s ALL=(root) NOPASSWD: %s quiet, %s balanced, %s performance\n' \
-  "$TARGET_USER" "$HELPER_DEST" "$HELPER_DEST" "$HELPER_DEST" \
+
+# Allow all kernel platform profile options
+PROFILES=("quiet" "balanced" "performance" "low-power" "cool" "balanced-performance")
+SUDO_CMDS=""
+for p in "${PROFILES[@]}"; do
+  if [[ -n "$SUDO_CMDS" ]]; then
+    SUDO_CMDS+=", "
+  fi
+  SUDO_CMDS+="$HELPER_DEST $p"
+done
+
+printf '%s ALL=(root) NOPASSWD: %s\n' "$TARGET_USER" "$SUDO_CMDS" \
   | sudo tee "$SUDOERS_FILE" >/dev/null
 sudo chmod 0440 "$SUDOERS_FILE"
 
-if ! sudo visudo -cf "$SUDOERS_FILE"; then
-  sudo rm -f "$SUDOERS_FILE"
-  echo "Sudoers validation failed; rule was removed." >&2
-  exit 1
+if command -v visudo >/dev/null 2>&1; then
+  if ! sudo visudo -cf "$SUDOERS_FILE"; then
+    sudo rm -f "$SUDOERS_FILE"
+    echo "Sudoers validation failed; rule was removed." >&2
+    exit 1
+  fi
 fi
 
 echo "Installed secure profile helper for user: $TARGET_USER"
-echo "Automatic profile switching can now change only quiet/balanced/performance."
+echo "Automatic and manual profile switching can now change platform profiles seamlessly."

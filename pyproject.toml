@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asus-thermals-control"
+version = "1.1.0"
+description = "Native Linux hardware telemetry monitor and platform profile manager"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Yashwanth Ponnam", email = "yashwanthponnam55@gmail.com" }
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: X11 Applications",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Hardware",
+    "Topic :: System :: Monitoring",
+]
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+thermals = "app:main"
+asus-thermals-control = "app:main"
+
+[project.urls]
+Homepage = "https://github.com/Yash55-max/asus-thermals-control"
+Repository = "https://github.com/Yash55-max/asus-thermals-control.git"
+"Bug Tracker" = "https://github.com/Yash55-max/asus-thermals-control/issues"

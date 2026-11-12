@@ -1,167 +1,195 @@
 # Thermals
 
-Thermals (Thermal Control Center) is a native Linux desktop application for monitoring hardware temperatures and managing ACPI thermal profiles. It provides an intuitive interface for real-time sensor telemetry, automated profile switching based on workload and temperature, and desktop alerts for thermal thresholds.
+**Thermals** (Thermal Control Center) is a native Linux application for monitoring hardware temperatures and managing platform thermal/power profiles across **all Linux environments** and hardware architectures.
 
-The application interacts strictly with Linux's standardized ACPI `platform_profile` subsystem. It avoids unsafe direct writes to Embedded Controller (EC) registers or raw PWM fan controls, relying entirely on vendor-approved firmware policies.
+It provides real-time sensor telemetry, automated workload-aware profile switching, desktop alerts for critical thresholds, and **dual graphical (GUI) and terminal (CLI)** interfaces for desktop and headless systems alike.
 
 ![Thermals Dashboard](assets/thermals-dashboard.png)
 
 ---
 
-## Features
+## Universal Linux Compatibility
 
-- **Multi-Sensor Telemetry Monitoring**
-  - Real-time temperature monitoring for CPU, GPU, NVMe SSD, and ACPI thermal zones.
-  - Primary metric extraction using `lm-sensors` with seamless fallback to kernel `sysfs` (`/sys/class/hwmon`).
-  - Polling cycle of 2 seconds with background asynchronous execution to prevent UI freezing.
+Thermals is engineered to run seamlessly across all Linux distributions, display servers, hardware vendors, and execution environments:
 
-- **Firmware-Managed Thermal Profiles**
-  - Supports standard ACPI platform profiles:
-    - **Quiet**: Limits acoustic output and optimizes for low noise.
-    - **Balanced**: Standard operational profile for general everyday usage.
-    - **Performance**: Elevates power limits and fan curves for maximum throughput.
-  - Active profile detection and dynamic UI button state synchronization.
+### Distributions Supported
+- **Debian / Ubuntu / Kali / Linux Mint / Pop!_OS**: `.deb` release package, APT installer.
+- **Fedora / RHEL / CentOS / Rocky Linux / AlmaLinux**: RPM package, DNF installer.
+- **Arch Linux / Manjaro / EndeavourOS**: `PKGBUILD`, Pacman.
+- **openSUSE (Tumbleweed & Leap)**: Zypper installer and RPM package.
+- **Alpine Linux / Void Linux / Gentoo / NixOS / Slackware**: Universal Python wheel and standard source installer.
 
-- **Automated Workload & Temperature-Aware Profile Switching**
-  - Heuristic profile selection driven by aggregate CPU utilization (`/proc/stat`) and temperature levels.
-  - Thermal override logic: automatically reverts to conservative profiles under elevated thermal load to avoid throttling.
-  - Anti-oscillation controls:
-    - Multi-sample confirmation (requires 3 consecutive matching readings).
-    - Minimum dwell timer (60 seconds) to prevent profile flapping during bursty workloads.
+### Hardware & Architecture Supported
+- **CPU Architectures**: `x86_64`, `aarch64` (ARM64), `armv7l`, `riscv64`.
+- **CPU Telemetry**:
+  - Intel Core / Xeon / Pentium (`coretemp`, `intel_rapl`, package & core thermals)
+  - AMD Ryzen / EPYC / Athlon (`k10temp`, `zenpower`, `amd_energy`, Tctl / Tdie / Tccd)
+  - ARM / Raspberry Pi / Apple Silicon (`bcm2835_thermal`, `cpu-thermal`, `soc-thermal`, `macsmc`, `panfrost`)
+  - Generic Linux ACPI and Sysfs thermal zones (`/sys/class/thermal/thermal_zone*`)
+- **GPU Telemetry**:
+  - AMD Radeon (`amdgpu`, `radeon`, edge/junction/VRAM metrics)
+  - NVIDIA GeForce / Quadro / RTX (proprietary driver via `nvidia-smi` and open-source `nouveau`)
+  - Intel Iris Xe / Arc / UHD (`i915`, `xe`)
+  - ARM Mali / Panfrost / Adreno
+- **Storage & Ambient Telemetry**:
+  - NVMe SSDs (`nvme`, composite sensors)
+  - SATA / SAS SSDs and HDDs (kernel `drivetemp`)
+  - Motherboard / ACPI thermal zones (`acpitz`, `asus_wmi`, `thinkpad_acpi`, `dell_smm`, `hp_wmi`)
 
-- **Desktop Temperature Alerts**
-  - Configurable alert thresholds for CPU and GPU temperatures.
-  - Native desktop notifications sent via `notify-send`.
-  - Built-in 5°C reset hysteresis to prevent notification spam near threshold boundaries.
-
-- **Rolling Temperature History**
-  - 60-sample historical chart displaying CPU and GPU trends with smooth interpolation and dynamic grid scaling.
-
-- **Secure Privilege Model**
-  - The UI runs under an unprivileged user session.
-  - Manual profile switching supports Polkit (`pkexec`) out of the box.
-  - Automated switching can be authorized via a dedicated, narrowly-scoped helper script with strict `sudoers` allowlisting.
+### Display & Execution Environments
+- **Desktop Environments**: GNOME, KDE Plasma, XFCE, Cinnamon, MATE, LXQt, Sway, Hyprland, i3.
+- **Display Servers**: Wayland, X11, Xwayland with dynamic font detection and High-DPI scaling.
+- **Headless / Server / SSH / Docker / WSL**: Automatic headless detection with full-featured CLI dashboard and JSON telemetry.
 
 ---
 
-## Prerequisites
+## Key Features
 
-### Operating System and Kernel
-- Linux distribution running kernel 5.8 or newer with ACPI platform profile support (`/sys/firmware/acpi/platform_profile`).
-- Tested on ASUS laptops (e.g., ASUS VivoBook series) utilizing the `asus_wmi` / `asus_nb_wmi` kernel drivers, but compatible with any system exposing the ACPI platform profile interface (Lenovo, Dell, HP, ThinkPad).
+- **Multi-Sensor Telemetry Monitoring**
+  - Real-time temperature monitoring for CPU, GPU, NVMe SSD, and ACPI thermal zones.
+  - Multi-tier metric collection: `lm-sensors` JSON -> direct kernel `hwmon` sysfs -> kernel `thermal_zone` -> `nvidia-smi`.
+  - Non-blocking 2-second background polling cycle.
 
-### Required Dependencies
-- Python 3.8 or later
-- Python Tkinter interface (`python3-tk`)
-- Hardware sensor utility: `lm-sensors` (recommended for optimal sensor parsing)
-- Notification utility: `libnotify-bin` (for desktop threshold alerts)
+- **Dual GUI & Terminal Interfaces**
+  - **Tkinter GUI**: Dark-mode dashboard with rolling temperature history charts and dynamic platform profile controls.
+  - **CLI Terminal Monitor**: Live ANSI terminal dashboard (`thermals --monitor`), one-shot report (`thermals --status`), or machine-readable JSON (`thermals --json`).
 
-On Debian and Ubuntu-based systems, install dependencies using:
+- **Firmware-Managed Platform Profiles**
+  - Dynamic discovery of supported kernel ACPI profiles:
+    - **Quiet / Low Power / Power Saver**: Silent operation, reduced acoustic footprint, and energy efficiency.
+    - **Balanced**: Standard operational profile for everyday workloads.
+    - **Performance / Balanced+**: Maximizes fan curves, power limits, and processor throughput.
+  - Works with ACPI `platform_profile` (Linux 5.8 through 6.12+ class devices) and `power-profiles-daemon` (`powerprofilesctl`).
 
-```bash
-sudo apt update
-sudo apt install python3 python3-tk lm-sensors libnotify-bin
-```
+- **Automated Workload & Temperature-Aware Profile Switching**
+  - Continuous CPU load sampling (`/proc/stat` with `os.getloadavg` fallback) and thermal tracking.
+  - Thermal override protection: forces conservative cooling modes under elevated thermal stress.
+  - Multi-sample confirmation (3 consecutive cycles) and minimum dwell timer (60s) to eliminate profile flapping.
 
-To configure sensor detection for your hardware, optionally run:
-
-```bash
-sudo sensors-detect --auto
-```
+- **Desktop Temperature Alerts**
+  - Configurable alert thresholds for CPU and GPU temperatures.
+  - Dispatches native desktop notifications via `notify-send`.
+  - Built-in 5°C reset hysteresis to avoid notification spam.
 
 ---
 
 ## Installation
 
-### Option A: Install via Debian Package (.deb)
+### Option 1: Universal Installer (Recommended for All Distros)
 
-Download the latest release package from the [GitHub Releases](https://github.com/Yash55-max/asus-thermals-control/releases) page:
-
-```bash
-sudo apt install ./asus-thermals-control_1.0.0_all.deb
-```
-
-### Option B: Install from Source
-
-Clone or download this repository, navigate to the folder, and execute the installation script:
+Clone this repository and run the universal installer:
 
 ```bash
 git clone https://github.com/Yash55-max/asus-thermals-control.git
 cd asus-thermals-control
-bash install-thermals.sh
+bash install.sh
 ```
 
-This script performs the following actions:
-- Copies application files to `~/.local/opt/thermals/`.
-- Installs the desktop launcher to `~/.local/share/applications/thermals.desktop`.
-- Updates the local desktop application database.
+**Installer Options:**
+- `bash install.sh --install-deps` : Automatically installs dependencies using your distro's native package manager (`apt`, `dnf`, `pacman`, `zypper`, `apk`, `xbps`).
+- `bash install.sh --user` : Installs to `~/.local` (default, no root password required).
+- `bash install.sh --system` : Installs system-wide to `/usr/local` (requires sudo).
+- `bash install.sh --with-helper` : Installs the privileged helper for unattended automated switching.
+- `bash install.sh --check` : Prints a diagnostic report of your system's telemetry and profile backends.
 
-You can now search for **Thermals** in your desktop environment's application launcher.
+---
 
-![Thermals Launcher](assets/thermals-launcher.png)
+### Option 2: Distribution Packages
 
-### 2. Configure Unattended Profile Switching (Recommended)
+#### Debian / Ubuntu / Kali / Linux Mint (.deb)
+```bash
+sudo apt install ./dist/asus-thermals-control_1.1.0_all.deb
+```
+Or build from source:
+```bash
+bash package.sh
+sudo apt install ./dist/asus-thermals-control_1.1.0_all.deb
+```
 
-Automatic profile switching runs continuously in the background while the application is open. To allow changing system thermal profiles without prompting for an authentication password every time a profile transition occurs, install the scoped privilege helper:
+#### Fedora / RHEL / openSUSE (RPM)
+Using the provided RPM spec file:
+```bash
+rpmbuild -bb asus-thermals-control.spec
+sudo dnf install ~/rpmbuild/RPMS/noarch/asus-thermals-control-1.1.0-1*.noarch.rpm
+```
+
+#### Arch Linux / Manjaro (PKGBUILD)
+```bash
+makepkg -si
+```
+
+#### Python PIP / PIPX (Any Linux Distribution)
+```bash
+pip install .
+# or using pipx
+pipx install .
+```
+
+---
+
+## CLI & Headless Usage
+
+Thermals can be used in servers, SSH terminals, scripts, and status bars without any graphical display:
+
+```bash
+# Print current telemetry snapshot and exit
+thermals --status
+
+# Output complete system telemetry in JSON format (ideal for scripts & Polybar/Waybar)
+thermals --json
+
+# Run real-time interactive terminal monitor (updates every 2 seconds)
+thermals --monitor
+
+# List platform thermal profiles supported on your hardware
+thermals --list-profiles
+
+# Set system thermal profile from the terminal
+thermals --set-profile performance
+```
+
+Example JSON output (`thermals --json`):
+```json
+{
+  "system": {
+    "summary": "ASUS VivoBook Go E1504FA • AMD Ryzen 5 7520U",
+    "os": "Ubuntu 24.04 LTS"
+  },
+  "temperatures": {
+    "cpu": 48.5,
+    "gpu": 44.0,
+    "nvme": 38.0,
+    "acpi": 47.0
+  },
+  "cpu_load_percent": 14.2,
+  "active_profile": "balanced",
+  "available_profiles": ["quiet", "balanced", "performance"]
+}
+```
+
+---
+
+## Privileged Helper Setup (Unattended Automated Switching)
+
+When using automatic profile switching or unprivileged profile transitions:
+
+1. **Power Profiles Daemon**: If `power-profiles-daemon` is running, profile switches execute without passwords for active desktop sessions.
+2. **ACPI Sysfs Helper**: To allow passwordless direct switching of kernel ACPI platform profiles, run:
 
 ```bash
 bash install-helper.sh
 ```
 
-What this script configures:
-1. Installs `/usr/local/sbin/asus-thermal-profile` owned by `root:root` with permissions `0755`.
-2. Adds a sudoers configuration file at `/etc/sudoers.d/asus-thermal-control` restricted specifically to your username.
-3. Strictly limits passwordless execution to only three permissible profile arguments: `quiet`, `balanced`, and `performance`.
-4. Validates syntax using `visudo -cf` before activating the rule.
-
----
-
-## Usage
-
-### Launching the Application
-
-- **Application Menu**: Search for `Thermals` in GNOME, KDE, or your desktop environment.
-- **Terminal (Installed)**:
-  ```bash
-  python3 ~/.local/opt/thermals/app.py
-  ```
-- **Terminal (Source directory)**:
-  ```bash
-  bash run.sh
-  ```
-
-### Manual Profile Selection
-Click any of the profile buttons in the **Thermal Profiles** section:
-- **Quiet**: Configures the platform for silent operation.
-- **Balanced**: Balances acoustic noise and processing power.
-- **Performance**: Maximizes fan curves and system performance.
-
-If the privilege helper is not installed, the application will display a standard Polkit authentication dialog (`pkexec`) to confirm the change.
-
-### Automatic Profile Switching
-1. Check the box labeled **Enable automatic thermal profile selection**.
-2. The application will continuously sample CPU load and sensor readings.
-3. Profile transitions occur only after the decision is verified across 3 successive sample cycles and the 60-second dwell interval has elapsed.
-
-### Setting Temperature Alerts
-1. In the **Temperature Alerts** section, verify that **Enable alerts** is checked.
-2. Enter your desired CPU and GPU alert thresholds in degrees Celsius (valid range: 50°C to 110°C).
-3. Click **Save settings**.
-4. When temperatures exceed the threshold, a notification is dispatched. The alert re-arms automatically once the sensor cools at least 5°C below the threshold.
-
-![Desktop Temperature Alert Notification](assets/thermals-alert-notification.png)
+This installs `/usr/local/sbin/asus-thermal-profile` and configures a strictly scoped `/etc/sudoers.d/asus-thermal-control` rule allowing only valid thermal profile commands (`quiet`, `balanced`, `performance`, `low-power`, `cool`, `balanced-performance`).
 
 ---
 
 ## Configuration
 
-Settings are stored in JSON format at:
-
+User settings are saved in standard JSON format:
 ```
 ~/.config/asus-thermal-control-center/config.json
 ```
-
-### Configuration Options
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -177,46 +205,26 @@ Settings are stored in JSON format at:
 
 ---
 
-## Architecture and Safety
-
-### Safety Principles
-- **No Direct Hardware Register Access**: Thermals does not write directly to fan controllers, I/O ports, or Embedded Controller registers. Writing improper values to EC registers can risk hardware damage or cause system instability.
-- **Kernel Platform Profile Interface**: All operations pass through Linux's official `/sys/firmware/acpi/platform_profile` interface, which delegates cooling tables, fan PWM curves, and power targets to the system BIOS/firmware.
-- **Hysteresis and Anti-Flapping**: Switching between thermal profiles triggers hardware power state adjustments. Thermals enforces a strict 60-second minimum dwell time and multi-sample confirmation to eliminate rapid toggling during transient workloads.
-
-### Project Structure
-
-```
-asus-thermals-control/
-├── app.py                  # Core application (Tkinter UI, telemetry collector, logic)
-├── asus-thermal-profile    # Scoped shell helper for writing platform_profile sysfs node
-├── install-helper.sh       # Installs the scoped helper into sudoers for passwordless use
-├── install-thermals.sh     # Installs the desktop application and .desktop file
-├── package.sh              # Packaging script for .deb and source distribution tarball
-├── run.sh                  # Direct runner script for source execution
-├── assets/                 # Application screenshots and visual assets
-└── README.md               # Documentation
-```
-
----
-
 ## Uninstallation
 
-To completely remove Thermals and its configuration from your system:
+To remove Thermals from your system:
 
-### 1. Remove Application Files and Desktop Entry
+### User Installation Removal:
 ```bash
-rm -rf ~/.local/opt/thermals
+rm -rf ~/.local/opt/thermals ~/.local/bin/thermals
 rm -f ~/.local/share/applications/thermals.desktop
+rm -f ~/.local/share/icons/hicolor/scalable/apps/thermals.svg
 update-desktop-database ~/.local/share/applications/ >/dev/null 2>&1 || true
 ```
 
-### 2. Remove Saved User Configuration (Optional)
+### System Installation Removal:
 ```bash
-rm -rf ~/.config/asus-thermal-control-center
+sudo rm -rf /usr/local/share/thermals /usr/local/bin/thermals
+sudo rm -f /usr/share/applications/thermals.desktop
+sudo rm -f /usr/share/icons/hicolor/scalable/apps/thermals.svg
 ```
 
-### 3. Remove Privileged Helper and Sudoers Rule (If Installed)
+### Remove Sudoers Helper (If installed):
 ```bash
 sudo rm -f /usr/local/sbin/asus-thermal-profile
 sudo rm -f /etc/sudoers.d/asus-thermal-control
@@ -226,4 +234,4 @@ sudo rm -f /etc/sudoers.d/asus-thermal-control
 
 ## License
 
-This project is released under the [MIT License](LICENSE).
+This project is licensed under the [MIT License](LICENSE).

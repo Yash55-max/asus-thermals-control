@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#18212d"/>
+      <stop offset="100%" stop-color="#10151d"/>
+    </linearGradient>
+    <linearGradient id="tempGrad" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#42c88a"/>
+      <stop offset="50%" stop-color="#f4b860"/>
+      <stop offset="100%" stop-color="#ff6b6b"/>
+    </linearGradient>
+    <linearGradient id="glowGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#63a6ff" stop-opacity="0.8"/>
+      <stop offset="100%" stop-color="#42c88a" stop-opacity="0.2"/>
+    </linearGradient>
+  </defs>
+  <!-- Background Shield/Rounded Tile -->
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#bgGrad)" stroke="#202b39" stroke-width="3"/>
+  
+  <!-- Outer Gauge Ring -->
+  <circle cx="64" cy="64" r="44" fill="none" stroke="#202b39" stroke-width="8"/>
+  <circle cx="64" cy="64" r="44" fill="none" stroke="url(#tempGrad)" stroke-width="8" stroke-linecap="round" stroke-dasharray="200" stroke-dashoffset="65" transform="rotate(135 64 64)"/>
+
+  <!-- Thermometer Center Stem -->
+  <rect x="60" y="34" width="8" height="34" rx="4" fill="#e8edf4" opacity="0.3"/>
+  <rect x="61" y="44" width="6" height="24" rx="3" fill="url(#tempGrad)"/>
+  
+  <!-- Bulb -->
+  <circle cx="64" cy="74" r="13" fill="#e8edf4" opacity="0.3"/>
+  <circle cx="64" cy="74" r="10" fill="#ff6b6b"/>
+
+  <!-- Pulse Core Highlight -->
+  <circle cx="64" cy="74" r="4" fill="#ffffff" opacity="0.8"/>
+</svg>

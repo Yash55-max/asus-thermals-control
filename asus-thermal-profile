@@ -2,16 +2,34 @@
 # Root-owned allowlisted helper. It writes only the Linux platform_profile sysfs node.
 set -euo pipefail
 PROFILE="${1:-}"
+
+# Standard Linux ACPI / sysfs platform profile candidates
 PROFILE_PATH="/sys/firmware/acpi/platform_profile"
 CHOICES_PATH="/sys/firmware/acpi/platform_profile_choices"
 
+# Check Linux 6.12+ class directory fallback if legacy path does not exist
+if [[ ! -e "$PROFILE_PATH" ]]; then
+  for cand in /sys/class/platform_profile/*/profile; do
+    if [[ -e "$cand" ]]; then
+      PROFILE_PATH="$cand"
+      CHOICES_PATH="${cand%/profile}/choices"
+      break
+    fi
+  done
+fi
+
 case "$PROFILE" in
-  quiet|balanced|performance) ;;
-  *) echo "Invalid profile. Allowed: quiet, balanced, performance." >&2; exit 2 ;;
+  quiet|balanced|performance|low-power|cool|balanced-performance) ;;
+  *) echo "Invalid profile. Allowed: quiet, balanced, performance, low-power, cool, balanced-performance." >&2; exit 2 ;;
 esac
 
-[[ -w "$PROFILE_PATH" ]] || { echo "Platform profile interface is not writable." >&2; exit 1; }
-grep -qw -- "$PROFILE" "$CHOICES_PATH" || { echo "Profile is not supported by this firmware." >&2; exit 1; }
+[[ -e "$PROFILE_PATH" ]] || { echo "Platform profile interface not found on this system." >&2; exit 1; }
+[[ -w "$PROFILE_PATH" ]] || { echo "Platform profile interface is not writable ($PROFILE_PATH)." >&2; exit 1; }
+
+if [[ -f "$CHOICES_PATH" ]]; then
+  grep -qw -- "$PROFILE" "$CHOICES_PATH" || { echo "Profile '$PROFILE' is not supported by this hardware/firmware choices." >&2; exit 1; }
+fi
+
 printf '%s\n' "$PROFILE" > "$PROFILE_PATH"
 printf 'Active profile: '
 cat "$PROFILE_PATH"

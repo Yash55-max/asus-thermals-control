@@ -1,27 +1,50 @@
 #!/usr/bin/env python3
-"""ASUS Thermal Control Center for Ubuntu.
+"""Thermals - Cross-Distribution Linux Hardware Telemetry and Thermal Profile Manager.
 
-Controls only Linux's platform_profile interface. It does not write PWM or EC
-registers. Automatic switching uses CPU load + temperature, hysteresis and a
-minimum dwell time to avoid profile oscillation.
+Supports all Linux environments:
+- Multi-architecture CPU/GPU/Storage/ACPI telemetry (Intel, AMD, ARM64, NVIDIA, Apple Silicon)
+- ACPI platform_profile sysfs and power-profiles-daemon backends
+- Dual GUI (Tkinter) and CLI (terminal monitor, status, JSON, one-shot) operation
+- Dynamic desktop font discovery and High-DPI support
+- Automated profile switching with anti-flapping hysteresis
 """
 from __future__ import annotations
 
+import argparse
 import json
+import os
+import platform
+import re
 import shutil
 import subprocess
+import sys
 import threading
-import tkinter as tk
-from tkinter import messagebox, ttk
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+# Optional Tkinter import for headless / non-graphical Linux environments
+try:
+    import tkinter as tk
+    from tkinter import font as tkfont
+    from tkinter import messagebox, ttk
+    TKINTER_AVAILABLE = True
+except ImportError:
+    tk = None  # type: ignore[assignment]
+    tkfont = None  # type: ignore[assignment]
+    messagebox = None  # type: ignore[assignment]
+    ttk = None  # type: ignore[assignment]
+    TKINTER_AVAILABLE = False
+
 APP_NAME = "Thermals"
-__version__ = "1.0.0"
-PROFILE_PATH = Path("/sys/firmware/acpi/platform_profile")
-PROFILE_CHOICES_PATH = Path("/sys/firmware/acpi/platform_profile_choices")
+__version__ = "1.1.0"
+
+# Filesystem paths
+PROFILE_STD_PATH = Path("/sys/firmware/acpi/platform_profile")
+PROFILE_STD_CHOICES = Path("/sys/firmware/acpi/platform_profile_choices")
 HW_MON_PATH = Path("/sys/class/hwmon")
+THERMAL_CLASS_PATH = Path("/sys/class/thermal")
 HELPER_PATH = Path("/usr/local/sbin/asus-thermal-profile")
 CONFIG_DIR = Path.home() / ".config" / "asus-thermal-control-center"
 CONFIG_PATH = CONFIG_DIR / "config.json"
@@ -32,11 +55,12 @@ AUTO_CONFIRM_SAMPLES = 3
 AUTO_MIN_DWELL_SECONDS = 60
 ALERT_RESET_HYSTERESIS = 5.0
 
+# UI Theme Colors
 BG, PANEL, PANEL_ALT = "#10151d", "#18212d", "#202b39"
 FG, MUTED, ACCENT = "#e8edf4", "#9aa8b8", "#63a6ff"
 GREEN, AMBER, RED = "#42c88a", "#f4b860", "#ff6b6b"
 
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: dict[str, Any] = {
     "cpu_alert_c": 85.0,
     "gpu_alert_c": 85.0,
     "alerts_enabled": True,
@@ -48,12 +72,117 @@ DEFAULT_CONFIG = {
     "auto_critical_c": 85.0,
 }
 
+PROFILE_DESCRIPTIONS: dict[str, tuple[str, str]] = {
+    "quiet": ("Quiet", "Lower noise & heat"),
+    "low-power": ("Low Power", "Energy saving"),
+    "power-saver": ("Power Saver", "Battery optimized"),
+    "cool": ("Cool", "Optimized cooling"),
+    "balanced": ("Balanced", "Standard everyday use"),
+    "balanced-performance": ("Balanced+", "Higher responsiveness"),
+    "performance": ("Performance", "Maximum throughput"),
+}
+
 
 def read_text(path: Path) -> str | None:
     try:
         return path.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError):
         return None
+
+
+def get_system_info() -> dict[str, str]:
+    """Dynamically detect host vendor, product model, CPU model, and OS release."""
+    vendor = ""
+    model = ""
+    cpu = ""
+
+    # 1. System Vendor & Product from DMI / Sysfs
+    for vpath in (
+        Path("/sys/class/dmi/id/sys_vendor"),
+        Path("/sys/devices/virtual/dmi/id/sys_vendor"),
+    ):
+        raw = read_text(vpath)
+        if raw and raw not in {"System manufacturer", "Default string", "To Be Filled By O.E.M."}:
+            vendor = raw
+            break
+
+    for mpath in (
+        Path("/sys/class/dmi/id/product_name"),
+        Path("/sys/devices/virtual/dmi/id/product_name"),
+        Path("/sys/class/dmi/id/product_version"),
+    ):
+        raw = read_text(mpath)
+        if raw and raw not in {"System Product Name", "Default string", "None"}:
+            model = raw
+            break
+
+    # Device Tree model for ARM / Raspberry Pi / Chromebooks
+    if not model:
+        raw_dt = read_text(Path("/proc/device-tree/model"))
+        if raw_dt:
+            model = raw_dt.replace("\x00", "").strip()
+
+    # Normalize vendor name
+    v_low = vendor.lower()
+    if "asus" in v_low:
+        vendor_clean = "ASUS"
+    elif "lenovo" in v_low:
+        vendor_clean = "Lenovo"
+    elif "dell" in v_low:
+        vendor_clean = "Dell"
+    elif "hp" in v_low or "hewlett" in v_low:
+        vendor_clean = "HP"
+    elif "apple" in v_low:
+        vendor_clean = "Apple"
+    elif "framework" in v_low:
+        vendor_clean = "Framework"
+    elif "system76" in v_low:
+        vendor_clean = "System76"
+    elif "msi" in v_low or "micro-star" in v_low:
+        vendor_clean = "MSI"
+    else:
+        vendor_clean = vendor
+
+    # 2. CPU Model detection
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if any(line.lower().startswith(k) for k in ("model name", "hardware", "processor")):
+                    parts = line.split(":", 1)
+                    if len(parts) == 2 and parts[1].strip():
+                        cpu = parts[1].strip()
+                        break
+    except OSError:
+        pass
+
+    if not cpu:
+        cpu = platform.processor() or platform.machine() or "Generic CPU"
+
+    # Clean redundant CPU markings
+    cpu = cpu.replace("(R)", "").replace("(TM)", "").replace(" CPU", "")
+    cpu = re.sub(r"\s*@\s*[\d\.]+\s*GHz", "", cpu)
+    cpu = " ".join(cpu.split())
+
+    # 3. OS Distribution
+    os_name = "Linux"
+    os_release = Path("/etc/os-release")
+    if os_release.exists():
+        raw_os = read_text(os_release) or ""
+        for line in raw_os.splitlines():
+            if line.startswith("PRETTY_NAME="):
+                os_name = line.split("=", 1)[1].strip('"\'')
+                break
+
+    sys_prefix = f"{vendor_clean} {model}".strip() if (vendor_clean or model) else f"{platform.system()} ({platform.machine()})"
+    summary = f"{sys_prefix}  •  {cpu}"
+    return {
+        "vendor": vendor_clean,
+        "model": model,
+        "cpu": cpu,
+        "os": os_name,
+        "summary": summary,
+    }
 
 
 def load_config() -> dict[str, Any]:
@@ -76,13 +205,52 @@ def parse_sensor_json(node: Any, parent: str = "") -> list[tuple[str, str, float
             if isinstance(value, dict):
                 records.extend(parse_sensor_json(value, f"{parent}/{key}"))
             elif key.endswith("_input") and isinstance(value, (int, float)):
-                records.append((parent.split("/")[0], parent.split("/")[-1], float(value)))
+                chip = parent.split("/")[0] if parent else "generic"
+                label = parent.split("/")[-1] if parent else key
+                records.append((chip, label, float(value)))
     return records
 
 
+def classify_sensor(chip: str, label: str) -> str | None:
+    """Classify a hardware sensor reading into cpu, gpu, nvme, or acpi."""
+    chip_l, label_l = chip.lower(), label.lower()
+
+    # CPU Sensors (Intel coretemp, AMD k10temp/zenpower, ARM soc/cpu, Apple Silicon macsmc)
+    if any(k in chip_l for k in (
+        "coretemp", "k10temp", "zenpower", "amd_energy", "cpu_thermal",
+        "soc_thermal", "bcm2835", "rockchip", "sunxi", "imx", "macsmc",
+        "apple_soc", "intel_rapl"
+    )):
+        return "cpu"
+    if any(k in label_l for k in ("package id", "tctl", "tdie", "cpu", "core 0", "soc", "tccd")):
+        return "cpu"
+
+    # GPU Sensors (AMD amdgpu/radeon, NVIDIA nouveau/nvidia, Intel i915/xe, ARM mali/panfrost)
+    if any(k in chip_l for k in ("amdgpu", "radeon", "nouveau", "i915", "xe", "panfrost", "mali", "nvidia")):
+        return "gpu"
+    if any(k in label_l for k in ("edge", "junction", "gpu", "gt", "vram")):
+        return "gpu"
+
+    # NVMe / Storage Sensors
+    if any(k in chip_l for k in ("nvme", "drivetemp")):
+        return "nvme"
+    if any(k in label_l for k in ("composite", "drive")):
+        return "nvme"
+
+    # ACPI / Motherboard Sensors
+    if any(k in chip_l for k in ("acpitz", "asus", "thinkpad", "dell", "hp", "it87", "nct677", "w83627")):
+        return "acpi"
+    if any(k in label_l for k in ("acpitz", "system", "ambient", "motherboard", "board")):
+        return "acpi"
+
+    return None
+
+
 def collect_sensors() -> dict[str, float]:
-    """Collect best-effort CPU, GPU, NVMe and ACPI temperatures in Celsius."""
+    """Collect hardware telemetry across Intel, AMD, ARM, and NVIDIA platforms."""
     found: dict[str, float] = {}
+
+    # 1. Primary extraction via lm-sensors JSON
     sensors_bin = shutil.which("sensors")
     if sensors_bin:
         try:
@@ -91,66 +259,280 @@ def collect_sensors() -> dict[str, float]:
                 text=True, timeout=4,
             )
             for chip, label, value in parse_sensor_json(json.loads(result.stdout)):
-                chip_l, label_l = chip.lower(), label.lower()
-                if "k10temp" in chip_l or "tctl" in label_l or "tdie" in label_l:
-                    found.setdefault("cpu", value)
-                elif "amdgpu" in chip_l or "edge" in label_l:
-                    found.setdefault("gpu", value)
-                elif "nvme" in chip_l or "composite" in label_l:
-                    found.setdefault("nvme", value)
-                elif "acpitz" in chip_l:
-                    found.setdefault("acpi", value)
+                if not (0.0 < value < 145.0):
+                    continue
+                category = classify_sensor(chip, label)
+                if category:
+                    # Prefer package / tctl over individual cores if available
+                    if category == "cpu" and any(k in label.lower() for k in ("package id", "tctl", "tdie")):
+                        found["cpu"] = value
+                    else:
+                        found.setdefault(category, value)
         except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
             pass
 
-    # Sysfs fallback for sensors that lm-sensors did not report.
-    for hwmon in HW_MON_PATH.glob("hwmon*"):
-        name = (read_text(hwmon / "name") or "").lower()
-        for input_file in hwmon.glob("temp*_input"):
-            raw = read_text(input_file)
-            if raw is None:
+    # 2. Sysfs hwmon extraction (direct kernel hwmon interface)
+    if HW_MON_PATH.exists():
+        for hwmon in HW_MON_PATH.glob("hwmon*"):
+            name = (read_text(hwmon / "name") or "").lower()
+            for input_file in hwmon.glob("temp*_input"):
+                raw = read_text(input_file)
+                if raw is None:
+                    continue
+                try:
+                    value = float(raw) / 1000.0
+                except ValueError:
+                    continue
+                if not (0.0 < value < 145.0):
+                    continue
+                label = (read_text(hwmon / input_file.name.replace("_input", "_label")) or "").lower()
+                category = classify_sensor(name, label or input_file.name)
+                if category:
+                    if category == "cpu" and any(k in label for k in ("package id", "tctl", "tdie")):
+                        found["cpu"] = value
+                    else:
+                        found.setdefault(category, value)
+
+    # 3. Kernel Thermal Zones extraction (/sys/class/thermal/thermal_zone*)
+    if THERMAL_CLASS_PATH.exists():
+        for zone in THERMAL_CLASS_PATH.glob("thermal_zone*"):
+            ztype = (read_text(zone / "type") or "").lower()
+            raw = read_text(zone / "temp")
+            if not raw:
                 continue
             try:
-                value = float(raw) / 1000.0
+                raw_val = float(raw)
+                val = raw_val / 1000.0 if raw_val > 1000.0 else raw_val
             except ValueError:
                 continue
-            label = read_text(hwmon / input_file.name.replace("_input", "_label")) or ""
-            label_l = label.lower()
-            if "k10temp" in name or "tctl" in label_l or "tdie" in label_l:
-                found.setdefault("cpu", value)
-            elif "amdgpu" in name or "edge" in label_l:
-                found.setdefault("gpu", value)
-            elif "nvme" in name or "composite" in label_l:
-                found.setdefault("nvme", value)
-            elif "acpitz" in name:
-                found.setdefault("acpi", value)
+            if not (0.0 < val < 145.0):
+                continue
+            if any(k in ztype for k in ("x86_pkg", "cpu", "soc", "core", "bcm2835", "k10temp", "coretemp")):
+                found.setdefault("cpu", val)
+            elif any(k in ztype for k in ("gpu", "mali", "panfrost")):
+                found.setdefault("gpu", val)
+            elif "acpi" in ztype:
+                found.setdefault("acpi", val)
+
+    # 4. Proprietary NVIDIA Driver Fallback (via nvidia-smi)
+    if "gpu" not in found and shutil.which("nvidia-smi"):
+        try:
+            res = subprocess.run(
+                ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                gpu_val = float(res.stdout.strip().splitlines()[0])
+                if 0.0 < gpu_val < 135.0:
+                    found["gpu"] = gpu_val
+        except (subprocess.SubprocessError, OSError, ValueError):
+            pass
+
     return found
 
 
-def fan_capabilities() -> tuple[list[str], list[str]]:
-    rpm, pwm = [], []
-    for hwmon in HW_MON_PATH.glob("hwmon*"):
-        rpm.extend(str(path) for path in hwmon.glob("fan*_input"))
-        pwm.extend(
-            str(path) for path in hwmon.glob("pwm[0-9]*")
-            if not path.name.endswith("_enable")
-        )
-    return rpm, pwm
+def fan_capabilities() -> tuple[list[tuple[str, int]], list[str]]:
+    """Return detected fan RPM telemetry and PWM control attributes."""
+    rpm_data: list[tuple[str, int]] = []
+    pwm_files: list[str] = []
+
+    if HW_MON_PATH.exists():
+        for hwmon in HW_MON_PATH.glob("hwmon*"):
+            hw_name = read_text(hwmon / "name") or "Fan"
+            for path in hwmon.glob("fan*_input"):
+                raw = read_text(path)
+                speed = 0
+                if raw and raw.isdigit():
+                    speed = int(raw)
+                label = read_text(hwmon / path.name.replace("_input", "_label")) or f"{hw_name} {path.name}"
+                rpm_data.append((label, speed))
+            for path in hwmon.glob("pwm[0-9]*"):
+                if not path.name.endswith("_enable"):
+                    pwm_files.append(str(path))
+
+    return rpm_data, pwm_files
 
 
 def cpu_load_percent() -> tuple[float, float] | None:
-    """Read aggregate CPU utilization from /proc/stat; caller manages sampling."""
+    """Read aggregate CPU utilization from /proc/stat; falls back to loadavg if restricted."""
     try:
-        fields = Path("/proc/stat").read_text().splitlines()[0].split()[1:]
+        fields = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()[1:]
         values = [int(value) for value in fields]
         idle = values[3] + (values[4] if len(values) > 4 else 0)
         total = sum(values)
-        return float(total), float(idle)  # type: ignore[return-value]
+        return float(total), float(idle)
     except (OSError, ValueError, IndexError):
+        # Fallback when /proc/stat has restricted permissions
+        try:
+            if hasattr(os, "getloadavg"):
+                avg1 = os.getloadavg()[0]
+                cores = os.cpu_count() or 1
+                estimated_load = min(100.0, max(0.0, (avg1 / cores) * 100.0))
+                # Return dummy ticks representing estimated usage
+                return 100.0, 100.0 - estimated_load
+        except Exception:
+            pass
         return None
 
 
+class ProfileManager:
+    """Manages thermal and power profiles across Linux kernels and desktops."""
+
+    @staticmethod
+    def find_sysfs_paths() -> tuple[Path | None, Path | None]:
+        if PROFILE_STD_PATH.exists():
+            choices = PROFILE_STD_CHOICES if PROFILE_STD_CHOICES.exists() else None
+            return PROFILE_STD_PATH, choices
+
+        # Linux 6.12+ class devices (/sys/class/platform_profile/*/profile)
+        class_dir = Path("/sys/class/platform_profile")
+        if class_dir.exists():
+            for cand in class_dir.glob("*/profile"):
+                if cand.exists():
+                    choices = cand.parent / "choices"
+                    return cand, choices if choices.exists() else None
+
+        return None, None
+
+    @classmethod
+    def get_available_profiles(cls) -> list[str]:
+        prof_path, choices_path = cls.find_sysfs_paths()
+        if choices_path and choices_path.exists():
+            raw = read_text(choices_path) or ""
+            choices = [p for p in raw.split() if p in PROFILE_DESCRIPTIONS]
+            if choices:
+                return choices
+
+        # Fallback to power-profiles-daemon if active
+        if shutil.which("powerprofilesctl"):
+            try:
+                res = subprocess.run(
+                    ["powerprofilesctl", "list"],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if res.returncode == 0:
+                    found: list[str] = []
+                    for line in res.stdout.splitlines():
+                        line = line.strip()
+                        if line.startswith(("*", " ")):
+                            parts = line.lstrip("* ").split(":", 1)
+                            name = parts[0].strip()
+                            if name in PROFILE_DESCRIPTIONS:
+                                found.append(name)
+                    if found:
+                        return found
+            except (subprocess.SubprocessError, OSError):
+                pass
+
+        return []
+
+    @classmethod
+    def get_current_profile(cls) -> str | None:
+        prof_path, _ = cls.find_sysfs_paths()
+        if prof_path and prof_path.exists():
+            val = read_text(prof_path)
+            if val:
+                return val
+
+        if shutil.which("powerprofilesctl"):
+            try:
+                res = subprocess.run(
+                    ["powerprofilesctl", "get"],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if res.returncode == 0 and res.stdout.strip():
+                    return res.stdout.strip()
+            except (subprocess.SubprocessError, OSError):
+                pass
+
+        return None
+
+    @classmethod
+    def set_profile(cls, profile: str, automatic: bool = False) -> tuple[bool, str]:
+        """Apply a thermal profile using direct sysfs, sudo helper, powerprofilesctl, or pkexec."""
+        prof_path, choices_path = cls.find_sysfs_paths()
+
+        # 1. Direct sysfs write (if running as root or node is writable)
+        if prof_path and os.access(prof_path, os.W_OK):
+            try:
+                prof_path.write_text(profile + "\n", encoding="utf-8")
+                return True, f"Set active profile to {profile}"
+            except OSError as exc:
+                return False, f"Direct write failed: {exc}"
+
+        # 2. Privileged helper script
+        if HELPER_PATH.exists() and shutil.which("sudo"):
+            try:
+                result = subprocess.run(
+                    ["sudo", "-n", str(HELPER_PATH), profile],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    return True, (result.stdout or "Profile applied successfully").strip()
+                err = (result.stderr or result.stdout).strip()
+                if "password is required" in err.lower() and automatic:
+                    return False, "Helper requires password. Run install-helper.sh once."
+            except (subprocess.SubprocessError, OSError) as exc:
+                return False, str(exc)
+
+        # 3. Desktop powerprofilesctl (works without password for logged-in user)
+        if shutil.which("powerprofilesctl"):
+            try:
+                # Map standard profile names to powerprofilesctl equivalents
+                daemon_prof = profile
+                if profile in {"quiet", "low-power", "cool"}:
+                    daemon_prof = "power-saver"
+                elif profile in {"performance", "balanced-performance"}:
+                    daemon_prof = "performance"
+                elif profile == "balanced":
+                    daemon_prof = "balanced"
+
+                res = subprocess.run(
+                    ["powerprofilesctl", "set", daemon_prof],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if res.returncode == 0:
+                    return True, f"Applied {daemon_prof} via power-profiles-daemon"
+            except (subprocess.SubprocessError, OSError):
+                pass
+
+        # 4. Polkit graphical prompt for manual changes
+        if not automatic and prof_path and shutil.which("pkexec"):
+            try:
+                res = subprocess.run(
+                    ["pkexec", "/usr/bin/tee", str(prof_path)],
+                    input=profile + "\n", capture_output=True, text=True, timeout=35,
+                )
+                if res.returncode == 0:
+                    return True, f"Thermal profile switched to {profile}"
+                return False, (res.stderr or res.stdout).strip()
+            except (subprocess.SubprocessError, OSError) as exc:
+                return False, str(exc)
+
+        return False, "Profile control interface requires privileges. Run install-helper.sh."
+
+
+def resolve_system_font() -> str:
+    """Find the best matching modern UI font available on the host system."""
+    if not TKINTER_AVAILABLE:
+        return "sans-serif"
+    preferred_fonts = (
+        "Ubuntu", "DejaVu Sans", "Liberation Sans", "Cantarell",
+        "Noto Sans", "Segoe UI", "Helvetica", "Arial"
+    )
+    try:
+        available = set(tkfont.families())
+        for name in preferred_fonts:
+            if name in available:
+                return name
+    except Exception:
+        pass
+    return "TkDefaultFont"
+
+
 class ThermalApp:
+    """Tkinter Desktop GUI for Thermals."""
+
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_NAME)
@@ -158,8 +540,10 @@ class ThermalApp:
         self.root.minsize(850, 720)
         self.root.configure(bg=BG)
 
+        self.sys_info = get_system_info()
+        self.font_family = resolve_system_font()
         self.config = load_config()
-        self.history = {"cpu": [], "gpu": []}
+        self.history: dict[str, list[float]] = {"cpu": [], "gpu": []}
         self.busy = False
         self.profile_change_busy = False
         self.profile_buttons: dict[str, ttk.Button] = {}
@@ -168,7 +552,7 @@ class ThermalApp:
         self.auto_candidate: str | None = None
         self.auto_candidate_count = 0
         self.last_auto_change = 0.0
-        self.last_profile_error = ""
+
         self.auto_var = tk.BooleanVar(value=bool(self.config["auto_enabled"]))
         self.alerts_var = tk.BooleanVar(value=bool(self.config["alerts_enabled"]))
         self.cpu_alert_var = tk.StringVar(value=str(self.config["cpu_alert_c"]))
@@ -188,140 +572,156 @@ class ThermalApp:
     def _configure_style(self) -> None:
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("TButton", font=("Ubuntu", 10), padding=(10, 8),
+        base_font = (self.font_family, 10)
+        style.configure("TButton", font=base_font, padding=(10, 8),
                         background=PANEL_ALT, foreground=FG, borderwidth=0)
         style.map("TButton", background=[("active", "#34465c"), ("disabled", "#26313e")])
-        style.configure("Profile.TButton", font=("Ubuntu", 10, "bold"), padding=(12, 11),
+        style.configure("Profile.TButton", font=(self.font_family, 10, "bold"), padding=(12, 11),
                         background=PANEL_ALT, foreground=FG)
-        style.configure("Selected.Profile.TButton", font=("Ubuntu", 10, "bold"),
+        style.configure("Selected.Profile.TButton", font=(self.font_family, 10, "bold"),
                         padding=(12, 11), background="#174d3b", foreground="#d9ffec")
 
     def _section(self, parent: tk.Widget, title: str, subtitle: str | None = None) -> tk.Frame:
         frame = tk.Frame(parent, bg=PANEL, padx=16, pady=13)
         frame.pack(fill="x", padx=24, pady=7)
         tk.Label(frame, text=title, bg=PANEL, fg=FG,
-                 font=("Ubuntu", 10, "bold")).pack(anchor="w")
+                 font=(self.font_family, 10, "bold")).pack(anchor="w")
         if subtitle:
             tk.Label(frame, text=subtitle, bg=PANEL, fg=MUTED,
-                     font=("Ubuntu", 8)).pack(anchor="w", pady=(3, 9))
+                     font=(self.font_family, 8)).pack(anchor="w", pady=(3, 9))
         return frame
 
     def _build_ui(self) -> None:
         header = tk.Frame(self.root, bg=BG)
         header.pack(fill="x", padx=25, pady=(17, 8))
         tk.Label(header, text="THERMAL CONTROL CENTER", bg=BG, fg=FG,
-                 font=("Ubuntu", 18, "bold")).pack(side="left")
+                 font=(self.font_family, 18, "bold")).pack(side="left")
         self.profile_badge = tk.Label(header, text="PROFILE: —", bg=PANEL_ALT, fg=ACCENT,
-                                      font=("Ubuntu", 9, "bold"), padx=12, pady=8)
+                                      font=(self.font_family, 9, "bold"), padx=12, pady=8)
         self.profile_badge.pack(side="right")
 
-        subtitle = tk.Label(self.root, text="ASUS VivoBook Go E1504FA  •  Ryzen 5 7520U",
-                            bg=BG, fg=MUTED, font=("Ubuntu", 9))
+        # Dynamic System Information Header
+        subtitle = tk.Label(
+            self.root,
+            text=self.sys_info["summary"],
+            bg=BG, fg=MUTED, font=(self.font_family, 9)
+        )
         subtitle.pack(anchor="w", padx=27)
 
+        # Telemetry Cards
         cards = tk.Frame(self.root, bg=BG)
         cards.pack(fill="x", padx=18, pady=8)
         specs = [
             ("cpu", "CPU TEMPERATURE", GREEN),
             ("gpu", "GPU TEMPERATURE", ACCENT),
-            ("nvme", "NVME DRIVE", AMBER),
-            ("acpi", "ACPI THERMAL", MUTED),
+            ("nvme", "STORAGE DRIVE", AMBER),
+            ("acpi", "ACPI / AMBIENT", MUTED),
         ]
         for index, (key, title, color) in enumerate(specs):
             card = tk.Frame(cards, bg=PANEL, padx=13, pady=12)
             card.grid(row=0, column=index, sticky="nsew", padx=5)
             cards.grid_columnconfigure(index, weight=1)
             tk.Label(card, text=title, bg=PANEL, fg=MUTED,
-                     font=("Ubuntu", 8, "bold")).pack(anchor="w")
+                     font=(self.font_family, 8, "bold")).pack(anchor="w")
             tk.Label(card, textvariable=self.temp_vars[key], bg=PANEL, fg=color,
-                     font=("Ubuntu", 20, "bold")).pack(anchor="w", pady=(7, 1))
+                     font=(self.font_family, 20, "bold")).pack(anchor="w", pady=(7, 1))
 
-        profile = self._section(
-            self.root, "THERMAL PROFILES",
-            "These are firmware-managed profiles. Fan RPM and PWM are not exposed by the current driver."
-        )
-        row = tk.Frame(profile, bg=PANEL)
-        row.pack(fill="x")
-        for key, label, detail in [
-            ("quiet", "Quiet", "Lower noise"),
-            ("balanced", "Balanced", "Everyday use"),
-            ("performance", "Performance", "Higher performance"),
-        ]:
-            button = ttk.Button(row, text=f"{label}\n{detail}", style="Profile.TButton",
-                                command=lambda value=key: self.set_profile(value, automatic=False))
+        # Dynamic Thermal Profiles Section
+        available = ProfileManager.get_available_profiles()
+        if available:
+            profile_sub = "Firmware-managed thermal policies configured via Linux ACPI platform_profile."
+        else:
+            profile_sub = "Platform profiles are not exposed by the current hardware/kernel (telemetry active)."
+
+        profile_sec = self._section(self.root, "THERMAL PROFILES", profile_sub)
+        self.profile_row = tk.Frame(profile_sec, bg=PANEL)
+        self.profile_row.pack(fill="x")
+
+        # Fallback default choices if system hasn't populated choices yet
+        display_profiles = available or ["quiet", "balanced", "performance"]
+        for key in display_profiles:
+            title, desc = PROFILE_DESCRIPTIONS.get(key, (key.replace("-", " ").title(), "Operational profile"))
+            button = ttk.Button(
+                self.profile_row,
+                text=f"{title}\n{desc}",
+                style="Profile.TButton",
+                command=lambda value=key: self.set_profile(value, automatic=False),
+            )
             button.pack(side="left", fill="x", expand=True, padx=(0, 7))
             self.profile_buttons[key] = button
 
+        # Automation Section
         automation = self._section(
             self.root, "AUTOMATIC PROFILE SWITCHING",
-            "Uses CPU load and temperature. High temperature overrides performance and selects Quiet."
+            "Monitors CPU load and thermals. High temperatures automatically step down to conservative cooling."
         )
         tk.Checkbutton(
             automation, text="Enable automatic thermal profile selection",
             variable=self.auto_var, command=self.toggle_auto,
             bg=PANEL, fg=FG, activebackground=PANEL, activeforeground=FG,
-            selectcolor=PANEL_ALT, font=("Ubuntu", 9),
+            selectcolor=PANEL_ALT, font=(self.font_family, 9),
         ).pack(anchor="w")
         tk.Label(automation, textvariable=self.cpu_load_var, bg=PANEL, fg=MUTED,
-                 font=("Ubuntu", 8)).pack(anchor="w", pady=(3, 0))
+                 font=(self.font_family, 8)).pack(anchor="w", pady=(3, 0))
         tk.Label(automation, textvariable=self.auto_status_var, bg=PANEL, fg=ACCENT,
-                 font=("Ubuntu", 8)).pack(anchor="w", pady=(3, 0))
+                 font=(self.font_family, 8)).pack(anchor="w", pady=(3, 0))
 
+        # Temperature Alerts Section
         alerts = self._section(
             self.root, "TEMPERATURE ALERTS",
-            "A desktop notification is sent when a threshold is crossed. Alerts re-arm after cooling by 5°C."
+            "Dispatches desktop alerts when thresholds are exceeded. Alerts re-arm after cooling by 5°C."
         )
         alert_row = tk.Frame(alerts, bg=PANEL)
         alert_row.pack(fill="x")
         tk.Checkbutton(
             alert_row, text="Enable alerts", variable=self.alerts_var,
             bg=PANEL, fg=FG, activebackground=PANEL, activeforeground=FG,
-            selectcolor=PANEL_ALT, font=("Ubuntu", 9),
+            selectcolor=PANEL_ALT, font=(self.font_family, 9),
         ).pack(side="left", padx=(0, 18))
-        tk.Label(alert_row, text="CPU °C", bg=PANEL, fg=MUTED).pack(side="left")
+        tk.Label(alert_row, text="CPU °C", bg=PANEL, fg=MUTED, font=(self.font_family, 9)).pack(side="left")
         ttk.Entry(alert_row, textvariable=self.cpu_alert_var, width=7).pack(side="left", padx=(5, 15))
-        tk.Label(alert_row, text="GPU °C", bg=PANEL, fg=MUTED).pack(side="left")
+        tk.Label(alert_row, text="GPU °C", bg=PANEL, fg=MUTED, font=(self.font_family, 9)).pack(side="left")
         ttk.Entry(alert_row, textvariable=self.gpu_alert_var, width=7).pack(side="left", padx=5)
         ttk.Button(alert_row, text="Save settings", command=self.save_settings).pack(side="right")
 
-        chart = self._section(self.root, "TEMPERATURE HISTORY", "Rolling CPU and GPU readings")
-        self.chart = tk.Canvas(chart, height=145, bg=PANEL, highlightthickness=0)
+        # Rolling Chart
+        chart = self._section(self.root, "TEMPERATURE HISTORY", "Rolling CPU and GPU telemetry trends")
+        self.chart = tk.Canvas(chart, height=140, bg=PANEL, highlightthickness=0)
         self.chart.pack(fill="both", expand=True, pady=(4, 0))
         self.chart.bind("<Configure>", lambda _event: self.draw_chart())
 
+        # Footer
         footer = tk.Frame(self.root, bg=BG)
         footer.pack(fill="x", padx=26, pady=(3, 12))
-        self.capability_var = tk.StringVar(value="Checking fan telemetry...")
+        self.capability_var = tk.StringVar(value="Checking hardware telemetry...")
         for variable, color in [
             (self.capability_var, AMBER),
             (self.status_var, MUTED),
             (self.last_update_var, MUTED),
         ]:
             tk.Label(footer, textvariable=variable, bg=BG, fg=color,
-                     font=("Ubuntu", 8)).pack(anchor="w", pady=1)
-
-    def _available_profiles(self) -> list[str]:
-        raw = read_text(PROFILE_CHOICES_PATH) or ""
-        return [p for p in raw.split() if p in {"quiet", "balanced", "performance"}]
-
-    def _current_profile(self) -> str | None:
-        value = read_text(PROFILE_PATH)
-        return value if value in {"quiet", "balanced", "performance"} else None
+                     font=(self.font_family, 8)).pack(anchor="w", pady=1)
 
     def _update_profile_controls(self) -> None:
-        current = self._current_profile()
+        current = ProfileManager.get_current_profile()
+        available = ProfileManager.get_available_profiles()
+
         for profile, button in self.profile_buttons.items():
-            available = profile in self._available_profiles()
-            button.state(["!disabled"] if available else ["disabled"])
+            is_avail = profile in available if available else False
+            button.state(["!disabled"] if is_avail else ["disabled"])
             button.configure(style="Selected.Profile.TButton" if profile == current else "Profile.TButton")
-        self.profile_badge.configure(text=f"PROFILE: {current.upper()}" if current else "PROFILE: UNKNOWN")
+
+        if current:
+            self.profile_badge.configure(text=f"PROFILE: {current.upper()}")
+        else:
+            self.profile_badge.configure(text="PROFILE: N/A" if not available else "PROFILE: UNKNOWN")
 
     def save_settings(self) -> None:
         try:
             cpu_alert = float(self.cpu_alert_var.get())
             gpu_alert = float(self.gpu_alert_var.get())
-            if not (50 <= cpu_alert <= 110 and 50 <= gpu_alert <= 110):
-                raise ValueError("Alert thresholds must be between 50°C and 110°C.")
+            if not (40.0 <= cpu_alert <= 115.0 and 40.0 <= gpu_alert <= 115.0):
+                raise ValueError("Alert thresholds must be between 40°C and 115°C.")
         except ValueError as exc:
             messagebox.showerror(APP_NAME, f"Invalid temperature threshold: {exc}")
             return
@@ -353,8 +753,10 @@ class ThermalApp:
         notify = shutil.which("notify-send")
         if notify:
             try:
-                subprocess.Popen([notify, "--app-name", APP_NAME, title, body],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.Popen(
+                    [notify, "--app-name", APP_NAME, title, body],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
                 return
             except OSError:
                 pass
@@ -389,39 +791,62 @@ class ThermalApp:
             return None
         return max(0.0, min(100.0, 100.0 * (delta_total - delta_idle) / delta_total))
 
+    def _resolve_profile_target(self, role: str) -> str | None:
+        """Map generic intent (quiet/balanced/performance) to system's actual profiles."""
+        avail = ProfileManager.get_available_profiles()
+        if not avail:
+            return None
+
+        if role == "quiet":
+            for cand in ("quiet", "low-power", "power-saver", "cool"):
+                if cand in avail:
+                    return cand
+        elif role == "performance":
+            for cand in ("performance", "balanced-performance"):
+                if cand in avail:
+                    return cand
+        elif role == "balanced":
+            if "balanced" in avail:
+                return "balanced"
+
+        return avail[0]
+
     def _automatic_target(self, temperatures: dict[str, float], load: float | None) -> str | None:
         cpu = temperatures.get("cpu")
         gpu = temperatures.get("gpu")
         if cpu is None:
             return None
 
-        # Thermal safety takes priority over performance.
+        # Thermal safety overrides performance targets
         hottest = max(cpu, gpu if gpu is not None else cpu)
         if hottest >= float(self.config["auto_critical_c"]):
-            return "quiet"
+            return self._resolve_profile_target("quiet")
         if cpu >= float(self.config["auto_hot_cpu_c"]):
-            return "quiet" if cpu >= 82 else "balanced"
+            return self._resolve_profile_target("quiet" if cpu >= 82 else "balanced")
         if load is not None and load >= float(self.config["auto_performance_load"]) and cpu < 75 and (gpu is None or gpu < 78):
-            return "performance"
+            return self._resolve_profile_target("performance")
         if load is not None and load <= float(self.config["auto_quiet_load"]) and cpu < float(self.config["auto_cool_cpu_c"]):
-            return "quiet"
-        return "balanced"
+            return self._resolve_profile_target("quiet")
+        return self._resolve_profile_target("balanced")
 
     def evaluate_automatic_profile(self, temperatures: dict[str, float], load: float | None) -> None:
         if not self.auto_var.get():
             return
-        if not HELPER_PATH.exists():
-            self.auto_status_var.set("Automatic mode needs the one-time privileged helper. Run install-helper.sh.")
+        available = ProfileManager.get_available_profiles()
+        if not available:
+            self.auto_status_var.set("Automatic mode: thermal profiles are not supported on this platform.")
             return
+
         target = self._automatic_target(temperatures, load)
         if target is None:
             self.auto_status_var.set("Automatic mode: waiting for CPU temperature/load readings.")
             return
-        current = self._current_profile()
+
+        current = ProfileManager.get_current_profile()
         if target == current:
             self.auto_candidate = None
             self.auto_candidate_count = 0
-            self.auto_status_var.set(f"Automatic mode: {current} is appropriate for current load/temperature.")
+            self.auto_status_var.set(f"Automatic mode: '{current}' is optimal for current workload.")
             return
 
         if target == self.auto_candidate:
@@ -431,12 +856,11 @@ class ThermalApp:
             self.auto_candidate_count = 1
 
         if self.auto_candidate_count < AUTO_CONFIRM_SAMPLES:
-            self.auto_status_var.set(f"Automatic mode: confirming {target} ({self.auto_candidate_count}/{AUTO_CONFIRM_SAMPLES}).")
+            self.auto_status_var.set(f"Automatic mode: verifying switch to {target} ({self.auto_candidate_count}/{AUTO_CONFIRM_SAMPLES}).")
             return
 
-        import time
         if time.monotonic() - self.last_auto_change < AUTO_MIN_DWELL_SECONDS:
-            self.auto_status_var.set("Automatic mode: waiting for profile dwell timer to prevent rapid switching.")
+            self.auto_status_var.set("Automatic mode: holding profile to prevent oscillation (dwell timer).")
             return
 
         self.auto_candidate = None
@@ -444,13 +868,11 @@ class ThermalApp:
         self.set_profile(target, automatic=True)
 
     def set_profile(self, profile: str, automatic: bool = False) -> None:
-        if profile not in self._available_profiles():
-            self.status_var.set(f"Profile '{profile}' is not advertised by this firmware.")
+        available = ProfileManager.get_available_profiles()
+        if available and profile not in available:
+            self.status_var.set(f"Profile '{profile}' is not advertised by this system.")
             return
         if self.profile_change_busy:
-            return
-        if automatic and not HELPER_PATH.exists():
-            self.auto_status_var.set("Install the privileged helper before enabling unattended profile changes.")
             return
 
         self.profile_change_busy = True
@@ -458,41 +880,20 @@ class ThermalApp:
         self.root.update_idletasks()
 
         def worker() -> None:
-            success, detail = False, ""
-            try:
-                if HELPER_PATH.exists() and shutil.which("sudo"):
-                    result = subprocess.run(
-                        ["sudo", "-n", str(HELPER_PATH), profile],
-                        capture_output=True, text=True, timeout=10,
-                    )
-                    success = result.returncode == 0
-                    detail = (result.stdout or result.stderr).strip()
-                elif not automatic and shutil.which("pkexec"):
-                    result = subprocess.run(
-                        ["pkexec", "/usr/bin/tee", str(PROFILE_PATH)],
-                        input=profile + "\n", capture_output=True, text=True, timeout=35,
-                    )
-                    success = result.returncode == 0
-                    detail = (result.stdout or result.stderr).strip()
-                else:
-                    detail = "Privileged helper is not installed. Run install-helper.sh once."
-            except (OSError, subprocess.SubprocessError) as exc:
-                detail = str(exc)
-
+            success, detail = ProfileManager.set_profile(profile, automatic=automatic)
             self.root.after(0, lambda: self._profile_result(profile, automatic, success, detail))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _profile_result(self, profile: str, automatic: bool, success: bool, detail: str) -> None:
-        import time
         self.profile_change_busy = False
         if success:
             self.status_var.set(f"Thermal profile changed to {profile}.")
             if automatic:
                 self.last_auto_change = time.monotonic()
-                self.auto_status_var.set(f"Automatic mode selected {profile}.")
+                self.auto_status_var.set(f"Automatic mode active: {profile}.")
         else:
-            message = detail or "The profile change was rejected."
+            message = detail or "The profile change request was rejected."
             self.status_var.set(f"Could not change profile: {message}")
             if automatic:
                 self.auto_status_var.set(f"Automatic switch failed: {message}")
@@ -508,14 +909,14 @@ class ThermalApp:
 
         def worker() -> None:
             temperatures = collect_sensors()
-            rpm, pwm = fan_capabilities()
+            fan_rpm, fan_pwm = fan_capabilities()
             load = self._cpu_load()
-            self.root.after(0, lambda: self._apply_refresh(temperatures, rpm, pwm, load))
+            self.root.after(0, lambda: self._apply_refresh(temperatures, fan_rpm, fan_pwm, load))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _apply_refresh(self, temperatures: dict[str, float], rpm: list[str],
-                       pwm: list[str], load: float | None) -> None:
+    def _apply_refresh(self, temperatures: dict[str, float], fan_rpm: list[tuple[str, int]],
+                       fan_pwm: list[str], load: float | None) -> None:
         for key, variable in self.temp_vars.items():
             variable.set(f"{temperatures[key]:.1f} °C" if key in temperatures else "Unavailable")
         for key in ("cpu", "gpu"):
@@ -531,17 +932,28 @@ class ThermalApp:
         self.check_alerts(temperatures)
         self.evaluate_automatic_profile(temperatures, load)
 
-        capability = f"Fan RPM: {len(rpm)} sensor(s) detected." if rpm else "Fan RPM: not exposed by this firmware/driver."
-        if pwm:
-            capability += f" {len(pwm)} PWM attribute(s) visible; direct writes are disabled."
-        self.capability_var.set(capability)
-        if not PROFILE_PATH.exists():
-            self.status_var.set("Platform profile interface unavailable.")
-        elif not self._available_profiles():
-            self.status_var.set("No supported platform profiles advertised.")
+        # Fan telemetry description
+        if fan_rpm:
+            speeds = [f"{label}: {speed} RPM" for label, speed in fan_rpm if speed > 0]
+            if speeds:
+                cap_text = f"Fans: {', '.join(speeds)}"
+            else:
+                cap_text = f"Fans: {len(fan_rpm)} tachometer(s) detected (idle or passive cooling)."
+        else:
+            cap_text = "Fan RPM: not exposed by this hardware/driver."
+        if fan_pwm:
+            cap_text += f" ({len(fan_pwm)} PWM attribute(s) visible; direct writes disabled)."
+        self.capability_var.set(cap_text)
+
+        # Status text
+        current_prof = ProfileManager.get_current_profile()
+        avail_profs = ProfileManager.get_available_profiles()
+        if not avail_profs:
+            self.status_var.set("Hardware monitoring active (ACPI profiles not exposed).")
         elif not self.profile_change_busy:
-            self.status_var.set(f"Firmware profile active: {self._current_profile() or 'unknown'}.")
-        self.last_update_var.set(f"Last update: {datetime.now().strftime('%H:%M:%S')}  •  Refresh: 2 seconds")
+            self.status_var.set(f"Platform profile active: {current_prof or 'unknown'}.")
+
+        self.last_update_var.set(f"Last update: {datetime.now().strftime('%H:%M:%S')}  •  Refresh: 2s")
         self._update_profile_controls()
         self.draw_chart()
         self.busy = False
@@ -555,16 +967,18 @@ class ThermalApp:
         values = self.history["cpu"] + self.history["gpu"]
         if not values:
             canvas.create_text(width / 2, height / 2, text="Collecting temperature history…",
-                               fill=MUTED, font=("Ubuntu", 9))
+                               fill=MUTED, font=(self.font_family, 9))
             return
+
         low, high = min(20.0, min(values) - 5), max(90.0, max(values) + 5)
         if high <= low:
             high = low + 10
+
         for tick in range(20, 101, 20):
             y = bottom - ((tick - low) / (high - low)) * (bottom - top)
             if top <= y <= bottom:
                 canvas.create_line(left, y, right, y, fill="#2b3949", dash=(2, 4))
-                canvas.create_text(18, y, text=str(tick), fill=MUTED, font=("Ubuntu", 7))
+                canvas.create_text(18, y, text=str(tick), fill=MUTED, font=(self.font_family, 7))
 
         for key, color in (("cpu", GREEN), ("gpu", ACCENT)):
             series = self.history[key]
@@ -578,11 +992,180 @@ class ThermalApp:
             canvas.create_line(*points, fill=color, width=2, smooth=True)
 
 
-def main() -> None:
-    root = tk.Tk()
-    ThermalApp(root)
-    root.mainloop()
+# ============================================================================
+# CLI and Terminal Operation (for Headless / SSH / Minimal Linux Environments)
+# ============================================================================
+
+def get_telemetry_snapshot() -> dict[str, Any]:
+    sys_info = get_system_info()
+    temperatures = collect_sensors()
+    fans, _ = fan_capabilities()
+    load_sample = cpu_load_percent()
+    cpu_load: float | None = None
+    if load_sample:
+        total, idle = load_sample
+        # If total is 100.0, it's the loadavg fallback
+        if total == 100.0:
+            cpu_load = 100.0 - idle
+        else:
+            cpu_load = None
+
+    active_profile = ProfileManager.get_current_profile()
+    available_profiles = ProfileManager.get_available_profiles()
+    config = load_config()
+
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "system": sys_info,
+        "temperatures": temperatures,
+        "cpu_load_percent": cpu_load,
+        "fans": [{"label": label, "rpm": rpm} for label, rpm in fans],
+        "active_profile": active_profile,
+        "available_profiles": available_profiles,
+        "config": config,
+    }
+
+
+def print_cli_status(snapshot: dict[str, Any] | None = None) -> None:
+    data = snapshot or get_telemetry_snapshot()
+    sys_info = data["system"]
+    temps = data["temperatures"]
+    fans = data["fans"]
+    active = data["active_profile"] or "N/A"
+    available = data["available_profiles"]
+
+    print("=" * 64)
+    print(f"  {APP_NAME} v{__version__} - Hardware & Thermal Telemetry")
+    print("=" * 64)
+    print(f"Host Device : {sys_info['summary']}")
+    print(f"Operating Sys: {sys_info['os']}")
+    print("-" * 64)
+
+    cpu_val = f"{temps['cpu']:.1f}°C" if "cpu" in temps else "Unavailable"
+    gpu_val = f"{temps['gpu']:.1f}°C" if "gpu" in temps else "Unavailable"
+    nvme_val = f"{temps['nvme']:.1f}°C" if "nvme" in temps else "Unavailable"
+    acpi_val = f"{temps['acpi']:.1f}°C" if "acpi" in temps else "Unavailable"
+
+    print(f"CPU Temp    : {cpu_val:<16}  GPU Temp     : {gpu_val}")
+    print(f"Storage Temp: {nvme_val:<16}  ACPI Ambient : {acpi_val}")
+
+    if data.get("cpu_load_percent") is not None:
+        print(f"CPU Load    : {data['cpu_load_percent']:.1f}%")
+
+    if fans:
+        fan_strs = [f"{f['label']}: {f['rpm']} RPM" for f in fans if f["rpm"] > 0]
+        if fan_strs:
+            print(f"Cooling Fans: {', '.join(fan_strs)}")
+        else:
+            print(f"Cooling Fans: {len(fans)} sensor(s) detected (0 RPM / passive)")
+    else:
+        print("Cooling Fans: Telemetry not exposed by firmware")
+
+    print("-" * 64)
+    print(f"Thermal Profile: {active.upper()}")
+    if available:
+        print(f"Available Modes: {', '.join(available)}")
+    else:
+        print("Available Modes: None (Hardware profiles not supported)")
+    print("=" * 64)
+
+
+def cli_monitor() -> None:
+    """Live updating terminal telemetry monitor."""
+    print(f"Starting {APP_NAME} terminal monitor (Press Ctrl+C to exit)...")
+    try:
+        while True:
+            # Clear terminal screen
+            sys.stdout.write("\033[2J\033[H")
+            print_cli_status()
+            print("\nUpdating every 2 seconds. Press Ctrl+C to exit.")
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("\nExited monitor.")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="thermals",
+        description="Thermals - Native Linux Telemetry Monitor and Thermal Profile Manager",
+    )
+    parser.add_argument("-s", "--status", action="store_true", help="Print current telemetry and exit")
+    parser.add_argument("-j", "--json", action="store_true", help="Print telemetry as JSON")
+    parser.add_argument("-m", "--monitor", action="store_true", help="Run real-time terminal monitor")
+    parser.add_argument("-l", "--list-profiles", action="store_true", help="List supported thermal profiles")
+    parser.add_argument("-p", "--set-profile", metavar="PROFILE", help="Set the thermal profile")
+    parser.add_argument("--cli", action="store_true", help="Force CLI terminal mode")
+    parser.add_argument("--gui", action="store_true", help="Force graphical desktop interface")
+    parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
+
+    args = parser.parse_args()
+
+    # CLI Actions
+    if args.json:
+        print(json.dumps(get_telemetry_snapshot(), indent=2))
+        return 0
+
+    if args.status:
+        print_cli_status()
+        return 0
+
+    if args.list_profiles:
+        profs = ProfileManager.get_available_profiles()
+        current = ProfileManager.get_current_profile()
+        if profs:
+            print("Supported thermal profiles on this hardware:")
+            for p in profs:
+                mark = "*" if p == current else " "
+                desc = PROFILE_DESCRIPTIONS.get(p, ("", ""))[1]
+                print(f" {mark} {p:<15} {desc}")
+        else:
+            print("No platform thermal profiles advertised by this hardware/kernel.")
+        return 0
+
+    if args.set_profile:
+        target = args.set_profile.strip().lower()
+        success, msg = ProfileManager.set_profile(target, automatic=False)
+        print(f"[{'SUCCESS' if success else 'FAILED'}] {msg}")
+        return 0 if success else 1
+
+    if args.monitor or args.cli:
+        cli_monitor()
+        return 0
+
+    # Graphical Interface Execution
+    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+    if not has_display and not args.gui:
+        # Graceful fallback when executed in headless / container / SSH session without X11
+        print(f"[{APP_NAME}] No graphical display detected (DISPLAY or WAYLAND_DISPLAY not set).")
+        print(f"[{APP_NAME}] Running in terminal status mode:\n")
+        print_cli_status()
+        print("\nTip: Run 'thermals --monitor' for live terminal monitoring, or 'thermals --help' for options.")
+        return 0
+
+    if not TKINTER_AVAILABLE:
+        print("Error: Tkinter is required for the graphical interface, but python3-tk is not installed.", file=sys.stderr)
+        print("\nInstall Tkinter for your Linux distribution:\n"
+              "  Debian / Ubuntu / Kali / Mint:  sudo apt install python3-tk\n"
+              "  Fedora / RHEL / CentOS:        sudo dnf install python3-tkinter\n"
+              "  Arch Linux / Manjaro:          sudo pacman -S tk\n"
+              "  openSUSE:                      sudo zypper in python3-tk\n"
+              "  Alpine Linux:                  sudo apk add py3-tkinter\n"
+              "  Void Linux:                    sudo xbps-install -S python3-tkinter\n", file=sys.stderr)
+        print("Alternatively, use CLI mode: thermals --status or thermals --monitor", file=sys.stderr)
+        return 1
+
+    try:
+        root = tk.Tk()
+        ThermalApp(root)
+        root.mainloop()
+        return 0
+    except tk.TclError as exc:
+        print(f"[{APP_NAME}] Could not initialize graphical interface: {exc}", file=sys.stderr)
+        print(f"[{APP_NAME}] Falling back to terminal mode:\n", file=sys.stderr)
+        print_cli_status()
+        return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

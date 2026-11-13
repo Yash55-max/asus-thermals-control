@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Installs a narrowly scoped NOPASSWD helper so automatic switching can work
-# without spawning an authentication dialog every time a profile changes.
+# Installs a secure NOPASSWD helper so thermal profile switching, target temperature regulation,
+# and cooling management work seamlessly without spawning password prompts.
 set -euo pipefail
 
 TARGET_USER="${SUDO_USER:-${USER:-}}"
@@ -24,21 +24,12 @@ if [[ ! -f "$HELPER_SOURCE" ]]; then
   exit 1
 fi
 
-echo "Installing privileged profile helper to $HELPER_DEST..."
+echo "Installing privileged hardware thermal helper to $HELPER_DEST..."
 sudo install -d -m 0755 "/usr/local/sbin"
 sudo install -o root -g root -m 0755 "$HELPER_SOURCE" "$HELPER_DEST"
 
-# Allow all kernel platform profile options
-PROFILES=("quiet" "balanced" "performance" "low-power" "cool" "balanced-performance")
-SUDO_CMDS=""
-for p in "${PROFILES[@]}"; do
-  if [[ -n "$SUDO_CMDS" ]]; then
-    SUDO_CMDS+=", "
-  fi
-  SUDO_CMDS+="$HELPER_DEST $p"
-done
-
-printf '%s ALL=(root) NOPASSWD: %s\n' "$TARGET_USER" "$SUDO_CMDS" \
+# Allow the strictly-validated root helper script to be executed by target user
+printf '%s ALL=(root) NOPASSWD: %s\n' "$TARGET_USER" "$HELPER_DEST" \
   | sudo tee "$SUDOERS_FILE" >/dev/null
 sudo chmod 0440 "$SUDOERS_FILE"
 
@@ -50,5 +41,5 @@ if command -v visudo >/dev/null 2>&1; then
   fi
 fi
 
-echo "Installed secure profile helper for user: $TARGET_USER"
-echo "Automatic and manual profile switching can now change platform profiles seamlessly."
+echo "Installed secure thermal helper for user: $TARGET_USER"
+echo "Thermal profiles, CPU thermal tuning, and cooling controls can now operate seamlessly."

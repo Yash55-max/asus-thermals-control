@@ -1,6 +1,6 @@
 # Maintainer: Yashwanth Ponnam <yashwanthponnam55@gmail.com>
 pkgname=asus-thermals-control
-pkgver=1.1.0
+pkgver=1.2.0
 pkgrel=1
 pkgdesc="Native Linux hardware telemetry monitor and platform profile manager"
 arch=('any')

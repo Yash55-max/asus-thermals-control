@@ -1,83 +1,181 @@
 # Thermals
 
-**Thermals** (Thermal Control Center) is a native Linux application for monitoring hardware temperatures and managing platform thermal/power profiles across **all Linux environments** and hardware architectures.
+**Thermals** (Thermal Control Center) is a native Linux application for monitoring all types of hardware telemetry and actively controlling system temperatures, cooling policies, and power profiles across **all Linux environments** and hardware architectures.
 
-It provides real-time sensor telemetry, automated workload-aware profile switching, desktop alerts for critical thresholds, and **dual graphical (GUI) and terminal (CLI)** interfaces for desktop and headless systems alike.
+It provides comprehensive sensor telemetry across all hardware categories (CPU, GPU, NVMe/SATA storage, motherboard, wireless network, battery, and cooling fans), an active **Target Temperature Limiter (smart thermostat)**, one-click **Cooler Boost (100% cooling)**, CPU Turbo Boost toggling, automated workload-aware profile switching, and **dual graphical (GUI) and terminal (CLI)** interfaces.
 
 ![Thermals Dashboard](assets/thermals-dashboard.png)
 
 ---
 
-## Universal Linux Compatibility
+## Universal Linux Hardware Detection
 
-Thermals is engineered to run seamlessly across all Linux distributions, display servers, hardware vendors, and execution environments:
+Thermals dynamically detects and exposes telemetry for **all types of hardware** present on your system:
 
-### Distributions Supported
-- **Debian / Ubuntu / Kali / Linux Mint / Pop!_OS**: `.deb` release package, APT installer.
-- **Fedora / RHEL / CentOS / Rocky Linux / AlmaLinux**: RPM package, DNF installer.
-- **Arch Linux / Manjaro / EndeavourOS**: `PKGBUILD`, Pacman.
-- **openSUSE (Tumbleweed & Leap)**: Zypper installer and RPM package.
-- **Alpine Linux / Void Linux / Gentoo / NixOS / Slackware**: Universal Python wheel and standard source installer.
+### 1. Processors (CPUs & SoCs)
+- **Intel Core / Xeon / Pentium / Celeron**: Package temperature, individual core thermals, RAPL power envelopes (`coretemp`, `intel_rapl`).
+- **AMD Ryzen / EPYC / Athlon / Threadripper**: Tctl, Tdie, per-CCD temperatures, energy sensors (`k10temp`, `zenpower`, `amd_energy`).
+- **ARM / SBCs / Apple Silicon**: Broadcom (`bcm2835`), Rockchip, Allwinner, Qualcomm, Apple Silicon (`macsmc`).
+- **Linux Thermal Zones**: Generic ACPI and sysfs thermal zones (`/sys/class/thermal/thermal_zone*`).
+- **CPU Metrics**: Live CPU utilization percentage, scaling governor, driver, EPP, and Turbo Boost status.
 
-### Hardware & Architecture Supported
-- **CPU Architectures**: `x86_64`, `aarch64` (ARM64), `armv7l`, `riscv64`.
-- **CPU Telemetry**:
-  - Intel Core / Xeon / Pentium (`coretemp`, `intel_rapl`, package & core thermals)
-  - AMD Ryzen / EPYC / Athlon (`k10temp`, `zenpower`, `amd_energy`, Tctl / Tdie / Tccd)
-  - ARM / Raspberry Pi / Apple Silicon (`bcm2835_thermal`, `cpu-thermal`, `soc-thermal`, `macsmc`, `panfrost`)
-  - Generic Linux ACPI and Sysfs thermal zones (`/sys/class/thermal/thermal_zone*`)
-- **GPU Telemetry**:
-  - AMD Radeon (`amdgpu`, `radeon`, edge/junction/VRAM metrics)
-  - NVIDIA GeForce / Quadro / RTX (proprietary driver via `nvidia-smi` and open-source `nouveau`)
-  - Intel Iris Xe / Arc / UHD (`i915`, `xe`)
-  - ARM Mali / Panfrost / Adreno
-- **Storage & Ambient Telemetry**:
-  - NVMe SSDs (`nvme`, composite sensors)
-  - SATA / SAS SSDs and HDDs (kernel `drivetemp`)
-  - Motherboard / ACPI thermal zones (`acpitz`, `asus_wmi`, `thinkpad_acpi`, `dell_smm`, `hp_wmi`)
+### 2. Graphics (GPUs & Accelerators)
+- **AMD Radeon**: Discrete & integrated GPUs (`amdgpu`, `radeon`), edge/core temperature, junction/hotspot, memory/VRAM thermals, PPT power draw (Watts), engine clock (sclk).
+- **NVIDIA GeForce / Quadro / RTX**: Proprietary driver via `nvidia-smi` (core temp, memory temp, power draw, power limit, fan speed %) and open-source `nouveau`.
+- **Intel Arc / Iris Xe / UHD**: Direct hwmon and driver telemetry (`i915`, `xe`).
+- **Embedded GPUs**: ARM Mali, Panfrost, Adreno.
+- **Multi-GPU Systems**: Simultaneously monitors both integrated (iGPU) and discrete (dGPU) adapters.
 
-### Display & Execution Environments
-- **Desktop Environments**: GNOME, KDE Plasma, XFCE, Cinnamon, MATE, LXQt, Sway, Hyprland, i3.
-- **Display Servers**: Wayland, X11, Xwayland with dynamic font detection and High-DPI scaling.
-- **Headless / Server / SSH / Docker / WSL**: Automatic headless detection with full-featured CLI dashboard and JSON telemetry.
+### 3. Storage Drives (NVMe & SATA / SAS)
+- **NVMe SSDs**: Composite temperature, individual controller/NAND sensors, high/critical temperature trip points (`nvme`).
+- **SATA / SAS SSDs & HDDs**: Kernel `drivetemp` hwmon interface and SCSI/block device mapping.
+
+### 4. Motherboard, Chipset & Ambient
+- **ACPI Ambient & Thermal Zones**: `acpitz`, generic thermal zones.
+- **Hardware Monitor Super I/O Chips**: ITE (`it87*`), Nuvoton (`nct677*`), Winbond (`w83627*`), Fintek.
+- **Vendor WMI Interfaces**: ASUS (`asus_wmi` / `asus-nb-wmi`), Lenovo ThinkPad (`thinkpad_acpi`), Dell (`dell_smm`), HP (`hp_wmi`).
+
+### 5. Wireless & Network Adapters
+- **Wi-Fi & Bluetooth**: MediaTek (`mt7921`), Intel (`iwlwifi`), Qualcomm Atheros (`ath10k`, `ath11k`), Realtek (`rtw89`, `rtw88`).
+- **Network Interface Controllers (NICs)**: 10GbE and high-speed network interfaces.
+
+### 6. Power Supply & Battery
+- **System Batteries**: Charge percentage, charge/discharge status, battery cell temperature, pack voltage, current, and wattage.
+- **AC Adapter**: Real-time power supply online/offline status.
+
+### 7. Cooling Fans & Tachometers
+- **Fan Tachometers**: Real-time RPM telemetry across CPU, GPU, and chassis fans.
+- **PWM Controllers**: Direct kernel hwmon PWM fan control attributes (`pwm1`–`pwmN`).
 
 ---
 
-## Key Features
+## Hardware Temperature Control Suite
 
-- **Multi-Sensor Telemetry Monitoring**
-  - Real-time temperature monitoring for CPU, GPU, NVMe SSD, and ACPI thermal zones.
-  - Multi-tier metric collection: `lm-sensors` JSON -> direct kernel `hwmon` sysfs -> kernel `thermal_zone` -> `nvidia-smi`.
-  - Non-blocking 2-second background polling cycle.
+Thermals empowers users to actively regulate and manage temperatures via software:
 
-- **Dual GUI & Terminal Interfaces**
-  - **Tkinter GUI**: Dark-mode dashboard with rolling temperature history charts and dynamic platform profile controls.
-  - **CLI Terminal Monitor**: Live ANSI terminal dashboard (`thermals --monitor`), one-shot report (`thermals --status`), or machine-readable JSON (`thermals --json`).
+### 1. Target Temperature Limiter (Smart Thermostat)
+- Set your preferred maximum hardware temperature ceiling (e.g., 65°C, 70°C, 75°C, 80°C).
+- When enabled, Thermals acts as a closed-loop supervisor:
+  - **Over Target**: Automatically applies conservative cooling (downshifts to Quiet profile, lowers CPU EPP, ramps fans).
+  - **Under Target**: Automatically relaxes back to standard balanced operation with built-in 5°C hysteresis.
+- Provides real-time visual feedback on whether temperatures are within the target or actively being cooled.
 
-- **Firmware-Managed Platform Profiles**
-  - Dynamic discovery of supported kernel ACPI profiles:
-    - **Quiet / Low Power / Power Saver**: Silent operation, reduced acoustic footprint, and energy efficiency.
-    - **Balanced**: Standard operational profile for everyday workloads.
-    - **Performance / Balanced+**: Maximizes fan curves, power limits, and processor throughput.
-  - Works with ACPI `platform_profile` (Linux 5.8 through 6.12+ class devices) and `power-profiles-daemon` (`powerprofilesctl`).
+### 2. Platform Thermal Profiles
+- Instant switching between Linux ACPI platform profiles:
+  - **Quiet / Power Saver**: Limits power envelopes and fan acoustics for whisper-quiet and cool operation.
+  - **Balanced**: Standard dynamic firmware thermal and acoustic curve.
+  - **Performance / Boost**: Maximizes processor power limits and cooling throughput.
+- Seamless backend integration: `power-profiles-daemon` (`powerprofilesctl`), direct sysfs, ASUS WMI `throttle_thermal_policy`, privileged helper, or Polkit (`pkexec`).
 
-- **Automated Workload & Temperature-Aware Profile Switching**
-  - Continuous CPU load sampling (`/proc/stat` with `os.getloadavg` fallback) and thermal tracking.
-  - Thermal override protection: forces conservative cooling modes under elevated thermal stress.
-  - Multi-sample confirmation (3 consecutive cycles) and minimum dwell timer (60s) to eliminate profile flapping.
+### 3. CPU Thermal Tuning (Turbo Boost & EPP)
+- **CPU Turbo Boost Switch**: Disabling CPU Turbo Boost drops peak CPU temperatures by **15°C to 20°C** under load with minimal impact on everyday responsiveness.
+- **Energy-Performance Preference (EPP)**: One-click selection of `Power Saver`, `Balanced`, or `Performance` CPU energy preferences.
 
-- **Desktop Temperature Alerts**
-  - Configurable alert thresholds for CPU and GPU temperatures.
-  - Dispatches native desktop notifications via `notify-send`.
-  - Built-in 5°C reset hysteresis to avoid notification spam.
+### 4. Cooling Presets & Fan Control
+- **❄️ Cooler Boost / Max Cooling**: Instant one-click action that engages 100% fan speeds and performance cooling to rapidly expel heat from hot hardware.
+- **🤫 Silent Cooling**: Immediately silences fans and engages aggressive power capping.
+- **Direct PWM Fan Sliders**: Adjust manual fan speeds from 0% to 100% on systems with controllable PWM hardware.
+
+---
+
+## Dual GUI & Terminal Interfaces
+
+### 1. Graphical Interface (GUI)
+- **Tab 1: 🖥️ All Hardware Telemetry**: Summary cards across 6 hardware classes + detailed inventory table displaying every detected sensor, live readings, kernel limits, and color-coded health badges.
+- **Tab 2: 🎛️ Temperature Controls**: Target Temperature Limiter, platform profiles, CPU Turbo Boost toggle, CPU power preferences, and Cooler Boost.
+- **Tab 3: 📈 History & Automation**: Rolling temperature trends chart, workload-aware auto switching, and desktop alert notifications.
+
+### 2. Terminal & CLI Controls (Headless / SSH / Scripts)
+```bash
+# Print formatted terminal status of all hardware and controls
+thermals --status
+
+# Output machine-readable JSON telemetry (Polybar, Waybar, scripts)
+thermals --json
+
+# List all detected hardware sensors and thresholds
+thermals --list-hardware
+
+# Run interactive real-time terminal monitor
+thermals --monitor
+
+# Set target temperature limit in Celsius (or 'off' to disable)
+thermals --set-target-temp 70
+thermals --set-target-temp off
+
+# Switch platform thermal profile
+thermals --set-profile quiet
+thermals --set-profile balanced
+thermals --set-profile performance
+
+# Toggle CPU Turbo Boost (drops CPU temps immediately)
+thermals --set-boost off
+thermals --set-boost on
+
+# Set CPU power preference
+thermals --set-epp power
+thermals --set-epp balance_performance
+thermals --set-epp performance
+
+# One-click instant max cooling (Cooler Boost)
+thermals --cooler-boost
+
+# One-click silent cooling
+thermals --silent
+```
+
+Example JSON output (`thermals --json`):
+```json
+{
+  "system": {
+    "vendor": "ASUS",
+    "model": "Vivobook Go E1504FA",
+    "cpu": "AMD Ryzen 5 7520U with Radeon Graphics",
+    "os": "Ubuntu 24.04 LTS",
+    "summary": "ASUS Vivobook Go E1504FA • AMD Ryzen 5 7520U with Radeon Graphics"
+  },
+  "temperatures": {
+    "cpu": 58.5,
+    "gpu": 52.0,
+    "nvme": 39.0,
+    "acpi": 55.0
+  },
+  "all_hardware": [
+    {
+      "id": "hwmon4_temp1_input",
+      "category": "cpu",
+      "device_name": "AMD Ryzen 5 7520U with Radeon Graphics",
+      "sensor_name": "Tctl",
+      "value": 58.5,
+      "unit": "°C",
+      "status": "normal"
+    },
+    {
+      "id": "hwmon7_temp1_input",
+      "category": "gpu",
+      "device_name": "GPU (AMDGPU)",
+      "sensor_name": "edge",
+      "value": 52.0,
+      "unit": "°C",
+      "status": "normal"
+    }
+  ],
+  "controls": {
+    "active_profile": "balanced",
+    "available_profiles": ["quiet", "balanced", "performance"],
+    "target_temp_enabled": true,
+    "target_temp_c": 70.0,
+    "cpu_boost": true,
+    "cpu_epp": "balance_performance"
+  }
+}
+```
 
 ---
 
 ## Installation
 
 ### Option 1: Universal Installer (Recommended for All Distros)
-
-Clone this repository and run the universal installer:
 
 ```bash
 git clone https://github.com/Yash55-max/asus-thermals-control.git
@@ -86,11 +184,11 @@ bash install.sh
 ```
 
 **Installer Options:**
-- `bash install.sh --install-deps` : Automatically installs dependencies using your distro's native package manager (`apt`, `dnf`, `pacman`, `zypper`, `apk`, `xbps`).
+- `bash install.sh --install-deps` : Automatically installs dependencies using your distro's package manager (`apt`, `dnf`, `pacman`, `zypper`, `apk`, `xbps`).
 - `bash install.sh --user` : Installs to `~/.local` (default, no root password required).
 - `bash install.sh --system` : Installs system-wide to `/usr/local` (requires sudo).
-- `bash install.sh --with-helper` : Installs the privileged helper for unattended automated switching.
-- `bash install.sh --check` : Prints a diagnostic report of your system's telemetry and profile backends.
+- `bash install.sh --with-helper` : Installs the privileged thermal helper for passwordless switching.
+- `bash install.sh --check` : Prints a diagnostic report of your hardware sensors and control interfaces.
 
 ---
 
@@ -98,19 +196,18 @@ bash install.sh
 
 #### Debian / Ubuntu / Kali / Linux Mint (.deb)
 ```bash
-sudo apt install ./dist/asus-thermals-control_1.1.0_all.deb
+sudo apt install ./dist/asus-thermals-control_1.2.0_all.deb
 ```
 Or build from source:
 ```bash
 bash package.sh
-sudo apt install ./dist/asus-thermals-control_1.1.0_all.deb
+sudo apt install ./dist/asus-thermals-control_1.2.0_all.deb
 ```
 
 #### Fedora / RHEL / openSUSE (RPM)
-Using the provided RPM spec file:
 ```bash
 rpmbuild -bb asus-thermals-control.spec
-sudo dnf install ~/rpmbuild/RPMS/noarch/asus-thermals-control-1.1.0-1*.noarch.rpm
+sudo dnf install ~/rpmbuild/RPMS/noarch/asus-thermals-control-1.2.0-1*.noarch.rpm
 ```
 
 #### Arch Linux / Manjaro (PKGBUILD)
@@ -127,108 +224,38 @@ pipx install .
 
 ---
 
-## CLI & Headless Usage
+## Privileged Helper Setup
 
-Thermals can be used in servers, SSH terminals, scripts, and status bars without any graphical display:
+Desktop thermal profile changes via `power-profiles-daemon` execute without password prompts out of the box.
 
-```bash
-# Print current telemetry snapshot and exit
-thermals --status
-
-# Output complete system telemetry in JSON format (ideal for scripts & Polybar/Waybar)
-thermals --json
-
-# Run real-time interactive terminal monitor (updates every 2 seconds)
-thermals --monitor
-
-# List platform thermal profiles supported on your hardware
-thermals --list-profiles
-
-# Set system thermal profile from the terminal
-thermals --set-profile performance
-```
-
-Example JSON output (`thermals --json`):
-```json
-{
-  "system": {
-    "summary": "ASUS VivoBook Go E1504FA • AMD Ryzen 5 7520U",
-    "os": "Ubuntu 24.04 LTS"
-  },
-  "temperatures": {
-    "cpu": 48.5,
-    "gpu": 44.0,
-    "nvme": 38.0,
-    "acpi": 47.0
-  },
-  "cpu_load_percent": 14.2,
-  "active_profile": "balanced",
-  "available_profiles": ["quiet", "balanced", "performance"]
-}
-```
-
----
-
-## Privileged Helper Setup (Unattended Automated Switching)
-
-When using automatic profile switching or unprivileged profile transitions:
-
-1. **Power Profiles Daemon**: If `power-profiles-daemon` is running, profile switches execute without passwords for active desktop sessions.
-2. **ACPI Sysfs Helper**: To allow passwordless direct switching of kernel ACPI platform profiles, run:
+To enable passwordless direct sysfs profile switching, fan PWM adjustments, and CPU boost regulation for background daemons or automated switching, run:
 
 ```bash
 bash install-helper.sh
 ```
 
-This installs `/usr/local/sbin/asus-thermal-profile` and configures a strictly scoped `/etc/sudoers.d/asus-thermal-control` rule allowing only valid thermal profile commands (`quiet`, `balanced`, `performance`, `low-power`, `cool`, `balanced-performance`).
+This installs `/usr/local/sbin/asus-thermal-profile` and configures a strictly scoped `/etc/sudoers.d/asus-thermal-control` rule allowing passwordless hardware management.
 
 ---
 
 ## Configuration
 
-User settings are saved in standard JSON format:
+Settings are stored in standard JSON format:
 ```
 ~/.config/asus-thermal-control-center/config.json
 ```
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `alerts_enabled` | boolean | `true` | Enables or disables desktop notification alerts. |
-| `cpu_alert_c` | float | `85.0` | CPU temperature threshold in Celsius for alert triggers. |
-| `gpu_alert_c` | float | `85.0` | GPU temperature threshold in Celsius for alert triggers. |
-| `auto_enabled` | boolean | `false` | Enables automatic profile switching based on load and thermals. |
-| `auto_performance_load` | float | `70.0` | CPU load percentage required to step up to Performance mode. |
-| `auto_quiet_load` | float | `20.0` | CPU load percentage threshold for stepping down to Quiet mode. |
-| `auto_cool_cpu_c` | float | `58.0` | Maximum CPU temperature allowed to permit Quiet mode downshift. |
-| `auto_hot_cpu_c` | float | `75.0` | CPU temperature threshold that triggers Balanced downshift. |
-| `auto_critical_c` | float | `85.0` | Critical threshold overriding performance to force cooling. |
-
----
-
-## Uninstallation
-
-To remove Thermals from your system:
-
-### User Installation Removal:
-```bash
-rm -rf ~/.local/opt/thermals ~/.local/bin/thermals
-rm -f ~/.local/share/applications/thermals.desktop
-rm -f ~/.local/share/icons/hicolor/scalable/apps/thermals.svg
-update-desktop-database ~/.local/share/applications/ >/dev/null 2>&1 || true
-```
-
-### System Installation Removal:
-```bash
-sudo rm -rf /usr/local/share/thermals /usr/local/bin/thermals
-sudo rm -f /usr/share/applications/thermals.desktop
-sudo rm -f /usr/share/icons/hicolor/scalable/apps/thermals.svg
-```
-
-### Remove Sudoers Helper (If installed):
-```bash
-sudo rm -f /usr/local/sbin/asus-thermal-profile
-sudo rm -f /etc/sudoers.d/asus-thermal-control
-```
+| `target_temp_enabled` | boolean | `false` | Enables active target temperature ceiling regulation. |
+| `target_temp_c` | float | `75.0` | Maximum target temperature in Celsius. |
+| `boost_enabled` | boolean | `true` | Preferred CPU Turbo Boost status. |
+| `alerts_enabled` | boolean | `true` | Enables desktop notification alerts. |
+| `cpu_alert_c` | float | `85.0` | CPU temperature threshold for alert triggers. |
+| `gpu_alert_c` | float | `85.0` | GPU temperature threshold for alert triggers. |
+| `auto_enabled` | boolean | `false` | Workload-aware automatic profile switching. |
+| `auto_performance_load` | float | `70.0` | CPU load percentage required to step up to Performance. |
+| `auto_quiet_load` | float | `20.0` | CPU load threshold for stepping down to Quiet. |
 
 ---
 

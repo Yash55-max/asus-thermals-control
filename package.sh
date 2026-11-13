@@ -2,7 +2,7 @@
 # Build release packages for asus-thermals-control across Linux distributions
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 PKG_NAME="asus-thermals-control"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DIST_DIR="$SCRIPT_DIR/dist"

@@ -1,27 +1,33 @@
 #!/usr/bin/env bash
-# Root-owned allowlisted helper for Thermals hardware control and thermal management.
+# Thermals Privileged Hardware Helper
+# Strictly validated, root-owned helper for platform thermal management.
 set -euo pipefail
+
+# Enforce secure umask and standard path
+umask 027
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
 CMD="${1:-}"
 ARG="${2:-}"
+EXTRA="${3:-}"
 
-# Standard Linux ACPI / sysfs platform profile candidates
-PROFILE_PATH="/sys/firmware/acpi/platform_profile"
-CHOICES_PATH="/sys/firmware/acpi/platform_profile_choices"
+# Canonical sysfs paths
+PROFILE_STD_PATH="/sys/firmware/acpi/platform_profile"
+PROFILE_STD_CHOICES="/sys/firmware/acpi/platform_profile_choices"
+ASUS_THROTTLE_PATH="/sys/devices/platform/asus-nb-wmi/throttle_thermal_policy"
+AMD_BOOST_PATH="/sys/devices/system/cpu/cpufreq/boost"
+INTEL_NO_TURBO_PATH="/sys/devices/system/cpu/intel_pstate/no_turbo"
 
-if [[ ! -e "$PROFILE_PATH" ]]; then
+# Resolve Linux 6.12+ class directory if legacy path does not exist
+if [[ ! -e "$PROFILE_STD_PATH" ]]; then
   for cand in /sys/class/platform_profile/*/profile; do
     if [[ -e "$cand" ]]; then
-      PROFILE_PATH="$cand"
-      CHOICES_PATH="${cand%/profile}/choices"
+      PROFILE_STD_PATH="$cand"
+      PROFILE_STD_CHOICES="${cand%/profile}/choices"
       break
     fi
   done
 fi
-
-ASUS_THROTTLE_PATH="/sys/devices/platform/asus-nb-wmi/throttle_thermal_policy"
-AMD_BOOST_PATH="/sys/devices/system/cpu/cpufreq/boost"
-INTEL_NO_TURBO_PATH="/sys/devices/system/cpu/intel_pstate/no_turbo"
 
 # Support legacy 1-arg invocation: asus-thermal-profile quiet
 if [[ $# -eq 1 ]]; then
@@ -41,21 +47,25 @@ fi
 
 case "$CMD" in
   profile)
-    case "$ARG" in
-      quiet|balanced|performance|low-power|cool|balanced-performance) ;;
-      *) echo "Invalid profile: $ARG. Allowed: quiet, balanced, performance, low-power, cool, balanced-performance." >&2; exit 2 ;;
-    esac
+    # Strictly validate against allowed platform profile enums
+    if ! [[ "$ARG" =~ ^(quiet|balanced|performance|low-power|cool|balanced-performance)$ ]]; then
+      echo "Error: Invalid profile '$ARG'." >&2
+      exit 2
+    fi
 
     applied=0
-    if [[ -e "$PROFILE_PATH" && -w "$PROFILE_PATH" ]]; then
-      if [[ -f "$CHOICES_PATH" ]]; then
-        grep -qw -- "$ARG" "$CHOICES_PATH" || { echo "Profile '$ARG' is not in choices" >&2; exit 1; }
+    if [[ -e "$PROFILE_STD_PATH" && -w "$PROFILE_STD_PATH" ]]; then
+      if [[ -f "$PROFILE_STD_CHOICES" ]]; then
+        grep -qw -- "$ARG" "$PROFILE_STD_CHOICES" || {
+          echo "Error: Profile '$ARG' is not supported by system platform_profile_choices." >&2
+          exit 1
+        }
       fi
-      printf '%s\n' "$ARG" > "$PROFILE_PATH"
+      printf '%s\n' "$ARG" > "$PROFILE_STD_PATH"
       applied=1
     fi
 
-    # Also sync Asus throttle thermal policy if present
+    # Sync ASUS WMI throttle policy if present
     if [[ -f "$ASUS_THROTTLE_PATH" && -w "$ASUS_THROTTLE_PATH" ]]; then
       case "$ARG" in
         performance|balanced-performance) printf '1\n' > "$ASUS_THROTTLE_PATH" ;;
@@ -66,9 +76,9 @@ case "$CMD" in
     fi
 
     if [[ $applied -eq 1 ]]; then
-      echo "Active profile: $ARG"
+      echo "Platform profile set to: $ARG"
     else
-      echo "No writable platform profile interface found." >&2
+      echo "Error: No writable platform profile interface found." >&2
       exit 1
     fi
     ;;
@@ -78,22 +88,25 @@ case "$CMD" in
       on|1|enable|true)
         if [[ -f "$AMD_BOOST_PATH" && -w "$AMD_BOOST_PATH" ]]; then printf '1\n' > "$AMD_BOOST_PATH"; fi
         if [[ -f "$INTEL_NO_TURBO_PATH" && -w "$INTEL_NO_TURBO_PATH" ]]; then printf '0\n' > "$INTEL_NO_TURBO_PATH"; fi
-        echo "CPU Boost enabled"
+        echo "CPU Turbo Boost enabled."
         ;;
       off|0|disable|false)
         if [[ -f "$AMD_BOOST_PATH" && -w "$AMD_BOOST_PATH" ]]; then printf '0\n' > "$AMD_BOOST_PATH"; fi
         if [[ -f "$INTEL_NO_TURBO_PATH" && -w "$INTEL_NO_TURBO_PATH" ]]; then printf '1\n' > "$INTEL_NO_TURBO_PATH"; fi
-        echo "CPU Boost disabled"
+        echo "CPU Turbo Boost disabled."
         ;;
-      *) echo "Invalid boost setting: $ARG (Allowed: on, off)" >&2; exit 2 ;;
+      *)
+        echo "Error: Invalid boost setting '$ARG'. Use 'on' or 'off'." >&2
+        exit 2
+        ;;
     esac
     ;;
 
   epp)
-    case "$ARG" in
-      power|balance_power|balance_performance|performance) ;;
-      *) echo "Invalid EPP preference: $ARG. Allowed: power, balance_power, balance_performance, performance." >&2; exit 2 ;;
-    esac
+    if ! [[ "$ARG" =~ ^(power|balance_power|balance_performance|performance)$ ]]; then
+      echo "Error: Invalid EPP preference '$ARG'." >&2
+      exit 2
+    fi
     count=0
     for epp in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
       if [[ -f "$epp" && -w "$epp" ]]; then
@@ -102,58 +115,97 @@ case "$CMD" in
       fi
     done
     if [[ $count -gt 0 ]]; then
-      echo "CPU EPP preference set to: $ARG ($count cores updated)"
+      echo "CPU EPP preference set to: $ARG ($count cores updated)."
     else
-      echo "No writable CPU EPP nodes found." >&2
+      echo "Error: No writable CPU EPP interfaces found." >&2
+      exit 1
+    fi
+    ;;
+
+  charge-limit)
+    # Validate battery charge threshold between 50% and 100%
+    if ! [[ "$ARG" =~ ^[0-9]+$ ]] || [ "$ARG" -lt 50 ] || [ "$ARG" -gt 100 ]; then
+      echo "Error: Invalid charge limit '$ARG'. Must be an integer between 50 and 100." >&2
+      exit 2
+    fi
+    found=0
+    for thresh in /sys/class/power_supply/BAT*/charge_control_end_threshold; do
+      if [[ -f "$thresh" && -w "$thresh" ]]; then
+        printf '%s\n' "$ARG" > "$thresh"
+        echo "Battery charge threshold set to $ARG% ($(basename "$(dirname "$thresh")"))."
+        found=1
+      fi
+    done
+    if [[ $found -eq 0 ]]; then
+      echo "Error: No writable charge_control_end_threshold found." >&2
       exit 1
     fi
     ;;
 
   throttle-policy)
-    case "$ARG" in
-      0|1|2) ;;
-      *) echo "Invalid throttle policy: $ARG (0=Normal, 1=Overboost, 2=Silent)" >&2; exit 2 ;;
-    esac
+    if ! [[ "$ARG" =~ ^[0-2]$ ]]; then
+      echo "Error: Invalid throttle policy '$ARG' (0=Normal, 1=Overboost, 2=Silent)." >&2
+      exit 2
+    fi
     if [[ -f "$ASUS_THROTTLE_PATH" && -w "$ASUS_THROTTLE_PATH" ]]; then
       printf '%s\n' "$ARG" > "$ASUS_THROTTLE_PATH"
-      echo "Asus throttle policy set to: $ARG"
+      echo "ASUS throttle policy set to $ARG."
     else
-      echo "Asus throttle policy node not available or not writable." >&2
+      echo "Error: ASUS throttle policy interface not available." >&2
       exit 1
     fi
     ;;
 
   fan)
-    PWM_PATH="${2:-}"
-    VAL="${3:-}"
-    if [[ "$PWM_PATH" != /sys/class/hwmon/* && "$PWM_PATH" != /sys/devices/* ]]; then
-      echo "Invalid PWM path: $PWM_PATH" >&2
+    PWM_PATH="$ARG"
+    VAL="$EXTRA"
+
+    # Strict path canonicalization & whitelist: must strictly reside in /sys/class/hwmon/hwmon*/
+    CANON_PATH="$(readlink -f "$PWM_PATH" 2>/dev/null || true)"
+    if ! [[ "$PWM_PATH" =~ ^/sys/class/hwmon/hwmon[0-9]+/pwm[1-9]$ ]] || [[ -z "$CANON_PATH" ]]; then
+      echo "Error: Prohibited PWM path '$PWM_PATH'. Only standard /sys/class/hwmon/hwmon*/pwm* nodes are allowed." >&2
       exit 2
     fi
-    ENABLE_FILE="${PWM_PATH}_enable"
+
+    ENABLE_PATH="${PWM_PATH}_enable"
     if [[ "$VAL" == "auto" ]]; then
-      if [[ -f "$ENABLE_FILE" && -w "$ENABLE_FILE" ]]; then
-        printf '2\n' > "$ENABLE_FILE"
+      if [[ -f "$ENABLE_PATH" && -w "$ENABLE_PATH" ]]; then
+        printf '2\n' > "$ENABLE_PATH"
+        echo "Fan set to automatic firmware control."
+      else
+        echo "Error: Fan enable control node not writable." >&2
+        exit 1
       fi
-      echo "Set fan to auto (firmware thermal curve)"
     else
+      # Validate numeric PWM between 0 and 255
       if ! [[ "$VAL" =~ ^[0-9]+$ ]] || [ "$VAL" -lt 0 ] || [ "$VAL" -gt 255 ]; then
-        echo "Invalid PWM value: $VAL (must be 0-255)" >&2
+        echo "Error: Invalid PWM value '$VAL'. Must be an integer 0-255." >&2
         exit 2
       fi
-      if [[ -f "$ENABLE_FILE" && -w "$ENABLE_FILE" ]]; then
-        printf '1\n' > "$ENABLE_FILE"
+
+      # Safety floor check: prevent setting fan completely to 0 via PWM helper
+      if [ "$VAL" -lt 50 ]; then
+        echo "Warning: Enforcing safe minimum fan floor (50 PWM / 20%) to prevent thermal stalling." >&2
+        VAL=50
+      fi
+
+      if [[ -f "$ENABLE_PATH" && -w "$ENABLE_PATH" ]]; then
+        printf '1\n' > "$ENABLE_PATH"
       fi
       if [[ -f "$PWM_PATH" && -w "$PWM_PATH" ]]; then
         printf '%s\n' "$VAL" > "$PWM_PATH"
+        echo "Fan PWM set to $VAL."
+      else
+        echo "Error: PWM interface not writable." >&2
+        exit 1
       fi
-      echo "Set fan PWM to: $VAL"
     fi
     ;;
 
   cooler-boost)
-    if [[ -e "$PROFILE_PATH" && -w "$PROFILE_PATH" ]]; then
-      printf 'performance\n' > "$PROFILE_PATH" || true
+    # Engage max fan curves and highest performance profile
+    if [[ -e "$PROFILE_STD_PATH" && -w "$PROFILE_STD_PATH" ]]; then
+      printf 'performance\n' > "$PROFILE_STD_PATH" || true
     fi
     if [[ -f "$ASUS_THROTTLE_PATH" && -w "$ASUS_THROTTLE_PATH" ]]; then
       printf '1\n' > "$ASUS_THROTTLE_PATH" || true
@@ -167,12 +219,12 @@ case "$CMD" in
         printf '255\n' > "$pwm" || true
       fi
     done
-    echo "Cooler Boost engaged (Performance profile, aggressive fans)"
+    echo "Cooler Boost engaged (Performance profile, 100% cooling)."
     ;;
 
   silent)
-    if [[ -e "$PROFILE_PATH" && -w "$PROFILE_PATH" ]]; then
-      printf 'quiet\n' > "$PROFILE_PATH" || true
+    if [[ -e "$PROFILE_STD_PATH" && -w "$PROFILE_STD_PATH" ]]; then
+      printf 'quiet\n' > "$PROFILE_STD_PATH" || true
     fi
     if [[ -f "$ASUS_THROTTLE_PATH" && -w "$ASUS_THROTTLE_PATH" ]]; then
       printf '2\n' > "$ASUS_THROTTLE_PATH" || true
@@ -182,11 +234,23 @@ case "$CMD" in
         printf 'power\n' > "$epp" || true
       fi
     done
-    echo "Silent mode engaged (Quiet profile, reduced power)"
+    echo "Silent mode engaged (Quiet profile, power capped)."
+    ;;
+
+  restore-fans)
+    # Failsafe: restore all detected hwmon PWM controls to automatic firmware curves
+    restored=0
+    for en in /sys/class/hwmon/hwmon*/pwm[1-9]_enable; do
+      if [[ -f "$en" && -w "$en" ]]; then
+        printf '2\n' > "$en" || true
+        restored=$((restored + 1))
+      fi
+    done
+    echo "Restored $restored fan(s) to automatic firmware thermal management."
     ;;
 
   *)
-    echo "Usage: asus-thermal-profile [profile <name> | boost <on|off> | epp <pref> | fan <path> <val|auto> | cooler-boost | silent | quiet | balanced | performance]" >&2
+    echo "Usage: asus-thermal-profile {profile <name>|boost <on|off>|epp <pref>|charge-limit <50-100>|fan <path> <val|auto>|cooler-boost|silent|restore-fans}" >&2
     exit 2
     ;;
 esac

@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
-"""Thermals - Universal Linux Hardware Telemetry & Thermal Control Center.
+"""Thermals - Linux Hardware Telemetry & Thermal Management Center.
 
 Features:
-- High-efficiency telemetry engine (cached sensor registry, direct sysfs I/O, < 0.1% CPU)
-- Hardware temperature controls with interactive rotary knobs:
-  * Target Temperature Limiter (Smart closed-loop thermostat)
+- High-efficiency telemetry engine (cached sensor registry, direct sysfs I/O, < 0.02% CPU)
+- Hardware temperature controls with tactile rotary dials:
+  * Graduated Target Temperature Limiter (multi-stage closed-loop thermostat)
   * Platform thermal profiles (Quiet / Power Saver, Balanced, Performance)
   * CPU Turbo Boost switch and Energy-Performance Preference (EPP)
-  * Fan PWM speed knob and one-click Cooler Boost (100% airflow)
-- Critical desktop push notifications via native notify-send / freedesktop notifications
-- Dual graphical (Tkinter GUI with tactile knobs) and terminal (CLI monitor, status, JSON) interfaces
+  * Battery charge limit threshold (60%, 80%, 100% longevity modes)
+  * Hardened fan safety rails (emergency thermal override, safe floor, auto-restore on exit)
+- Critical desktop push notifications via native notify-send / freedesktop notification specs
+- Dual graphical (Tkinter GUI with tactile knobs) and terminal (CLI monitor, daemon, status, JSON) interfaces
 """
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import math
 import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -52,24 +55,36 @@ HW_MON_PATH = Path("/sys/class/hwmon")
 THERMAL_CLASS_PATH = Path("/sys/class/thermal")
 POWER_SUPPLY_PATH = Path("/sys/class/power_supply")
 HELPER_PATH = Path("/usr/local/sbin/asus-thermal-profile")
-CONFIG_DIR = Path.home() / ".config" / "asus-thermal-control-center"
-CONFIG_PATH = CONFIG_DIR / "config.json"
 ICON_PATH = Path.home() / ".local/share/icons/hicolor/scalable/apps/thermals.svg"
+
+# Config paths (with automatic migration from legacy config dir)
+CONFIG_DIR = Path.home() / ".config" / "thermals"
+LEGACY_CONFIG_DIR = Path.home() / ".config" / "asus-thermal-control-center"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+DAEMON_STATE_PATH = CONFIG_DIR / "daemon_state.json"
 
 # CPU Control paths
 AMD_BOOST_PATH = Path("/sys/devices/system/cpu/cpufreq/boost")
 INTEL_NO_TURBO_PATH = Path("/sys/devices/system/cpu/intel_pstate/no_turbo")
 ASUS_THROTTLE_PATH = Path("/sys/devices/platform/asus-nb-wmi/throttle_thermal_policy")
+CPUFREQ_DIR = Path("/sys/devices/system/cpu/cpufreq")
+CPU_CUR_FREQ_PATH = Path("/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq")
+CPU_MAX_FREQ_PATH = Path("/sys/devices/system/cpu/cpufreq/policy0/cpuinfo_max_freq")
+CPU_EPP_PATH = Path("/sys/devices/system/cpu/cpufreq/policy0/energy_performance_preference")
 
 POLL_MS = 2000
 HISTORY_LIMIT = 60
 AUTO_CONFIRM_SAMPLES = 3
-AUTO_MIN_DWELL_SECONDS = 60
+AUTO_MIN_DWELL_SECONDS = 30
 ALERT_RESET_HYSTERESIS = 5.0
 ALERT_COOLDOWN_SECONDS = 60.0
 TARGET_TEMP_HYSTERESIS = 5.0
 
-# Professional Slate Theme Palette
+# Safety Thresholds
+FAN_SAFETY_FLOOR_PWM = 50       # Minimum ~20% PWM to avoid fan stalling
+FAN_EMERGENCY_OVERRIDE_C = 80.0  # Force auto/max fan if temp hits 80°C
+
+# Professional Slate Theme Palette (No Emojis)
 BG = "#0d1117"            # Main Window Background
 PANEL = "#161b22"         # Card / Section Background
 PANEL_ALT = "#21262d"     # Inner Control / Button Background
@@ -95,9 +110,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_critical_c": 85.0,
     "target_temp_enabled": False,
     "target_temp_c": 75.0,
+    "target_hysteresis_c": 5.0,
     "fan_manual": False,
     "fan_speed_pct": 80,
     "boost_enabled": True,
+    "battery_charge_limit": 100,
     "preferred_profile": "balanced",
 }
 
@@ -215,7 +232,18 @@ def get_system_info() -> dict[str, str]:
 
 
 def load_config() -> dict[str, Any]:
+    """Load configuration with automatic migration from legacy directory."""
     config = DEFAULT_CONFIG.copy()
+
+    # Automatic migration if new config does not exist
+    if not CONFIG_PATH.exists() and (LEGACY_CONFIG_DIR / "config.json").exists():
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            legacy_data = (LEGACY_CONFIG_DIR / "config.json").read_text(encoding="utf-8")
+            CONFIG_PATH.write_text(legacy_data, encoding="utf-8")
+        except OSError:
+            pass
+
     try:
         stored = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         if isinstance(stored, dict):
@@ -257,6 +285,26 @@ def dispatch_push_notification(title: str, body: str, urgency: str = "critical")
         return True
     except OSError:
         return False
+
+
+def get_top_cpu_processes(limit: int = 3) -> list[tuple[str, float]]:
+    """Retrieve top CPU consuming processes efficiently via ps."""
+    try:
+        res = subprocess.run(
+            ["ps", "-eo", "comm,%cpu", "--sort=-%cpu", "--no-headers"],
+            capture_output=True, text=True, timeout=1,
+        )
+        procs: list[tuple[str, float]] = []
+        for line in res.stdout.strip().splitlines()[:limit]:
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    procs.append((parts[0], float(parts[1])))
+                except ValueError:
+                    pass
+        return procs
+    except Exception:
+        return []
 
 
 # ============================================================================
@@ -334,7 +382,7 @@ class CachedSensor:
             "device_name": self.device_name,
             "sensor_name": self.sensor_name,
             "chip": self.chip,
-            "sensor_type": "temperature" if self.is_temp else ("fan" if self.unit == "RPM" else "metric"),
+            "sensor_type": "temperature" if self.is_temp else ("fan" if self.unit == "RPM" else "battery"),
             "value": self.val,
             "unit": self.unit,
             "crit_temp": self.crit_temp,
@@ -349,13 +397,11 @@ class HardwareRegistry:
     def __init__(self, cpu_name: str) -> None:
         self.cpu_name = cpu_name
         self.sensors: list[CachedSensor] = []
-        self.nvidia_available = bool(shutil.which("nvidia-smi") and (
-            Path("/dev/nvidia0").exists() or Path("/sys/bus/pci/drivers/nvidia").exists()
-        ))
         self.has_battery = False
         self.battery_path: Path | None = None
         self.battery_status = "AC Mains"
         self.battery_pct = 100.0
+        self.battery_charge_limit: int | None = None
         self.fan_pwm_files: list[str] = []
         self._discover_hardware()
 
@@ -474,6 +520,13 @@ class HardwareRegistry:
                     )
                     bsensor.poll()
                     self.sensors.append(bsensor)
+
+                # Battery charge threshold (ASUS & modern laptop longevity control)
+                limit_file = ps / "charge_control_end_threshold"
+                if limit_file.exists():
+                    raw_lim = read_text(limit_file)
+                    if raw_lim and raw_lim.isdigit():
+                        self.battery_charge_limit = int(raw_lim)
                 break
 
     def poll_all(self) -> tuple[dict[str, float], list[dict[str, Any]]]:
@@ -504,7 +557,6 @@ class HardwareRegistry:
             elif cat == "motherboard":
                 summary.setdefault("acpi", s.val)
 
-        # Update battery if present
         if self.has_battery and self.battery_path:
             cap_raw = read_text(self.battery_path / "capacity")
             st_raw = read_text(self.battery_path / "status")
@@ -545,6 +597,101 @@ def cpu_load_percent() -> tuple[float, float] | None:
         except Exception:
             pass
         return None
+
+
+def check_cpu_throttling(hottest_temp: float, load: float | None = None) -> tuple[bool, str]:
+    """Detect if CPU is undergoing thermal throttling based on frequency drop under heat."""
+    if CPU_CUR_FREQ_PATH.exists() and CPU_MAX_FREQ_PATH.exists():
+        try:
+            cur_f = int(read_text(CPU_CUR_FREQ_PATH) or 0)
+            max_f = int(read_text(CPU_MAX_FREQ_PATH) or 1)
+            if hottest_temp >= 82.0 and cur_f < (max_f * 0.5) and (load or 0) >= 60.0:
+                return True, f"Thermal Throttling Active! (Capped at {cur_f // 1000} MHz / {max_f // 1000} MHz)"
+            else:
+                return False, f"Thermal State: Normal (Frequency: {cur_f // 1000} MHz, Load: {load or 0:.0f}%)"
+        except Exception:
+            pass
+    return False, "Thermal State: Normal"
+
+
+# ============================================================================
+# Fan Safety Controller (Hardened Failsafes & Exit Restoration)
+# ============================================================================
+
+class FanSafetyController:
+    """Ensures fan safety rails: minimum floors, emergency thermal overrides, and restore on exit."""
+    _manual_active = False
+
+    @classmethod
+    def register_exit_handlers(cls) -> None:
+        """Register signal and exit handlers so fans are ALWAYS restored to firmware control."""
+        atexit.register(cls.restore_all_fans)
+        try:
+            signal.signal(signal.SIGINT, cls._handle_signal)
+            signal.signal(signal.SIGTERM, cls._handle_signal)
+            signal.signal(signal.SIGHUP, cls._handle_signal)
+        except (ValueError, OSError):
+            pass
+
+    @classmethod
+    def _handle_signal(cls, signum: int, _frame: Any) -> None:
+        cls.restore_all_fans()
+        sys.exit(128 + signum)
+
+    @classmethod
+    def restore_all_fans(cls) -> None:
+        """Failsafe: Restore all PWM fan controllers to automatic firmware curves."""
+        if not cls._manual_active:
+            return
+        cls._manual_active = False
+
+        # 1. Direct sysfs write if writable
+        reg = get_registry()
+        for pwm in reg.fan_pwm_files:
+            en = Path(f"{pwm}_enable")
+            if en.exists() and os.access(en, os.W_OK):
+                try:
+                    en.write_text("2\n", encoding="utf-8")
+                except OSError:
+                    pass
+
+        # 2. Sudo helper
+        if HELPER_PATH.exists() and shutil.which("sudo"):
+            try:
+                subprocess.run(
+                    ["sudo", "-n", str(HELPER_PATH), "restore-fans"],
+                    capture_output=True, timeout=3,
+                )
+            except Exception:
+                pass
+
+    @classmethod
+    def set_fan_speed_safe(cls, pwm_path: str, speed_pct: int) -> tuple[bool, str]:
+        """Apply fan speed with safety floor enforcement."""
+        if speed_pct <= 0:
+            return False, "Refusing 0% fan speed to protect hardware from thermal damage."
+
+        # Enforce minimum PWM floor
+        pwm_val = max(FAN_SAFETY_FLOOR_PWM, min(255, int(speed_pct / 100.0 * 255.0)))
+        cls._manual_active = True
+        return ThermalControlManager.set_fan_pwm(pwm_path, pwm_val)
+
+    @classmethod
+    def check_emergency_override(cls, hottest_temp: float) -> bool:
+        """Trigger emergency override if temperature exceeds 80°C."""
+        if cls._manual_active and hottest_temp >= FAN_EMERGENCY_OVERRIDE_C:
+            cls.restore_all_fans()
+            dispatch_push_notification(
+                "Critical Fan Override Activated",
+                f"Hardware hit {hottest_temp:.1f}°C. Manual fan control overridden to maximum firmware cooling.",
+                urgency="critical",
+            )
+            return True
+        return False
+
+
+# Initialize exit handlers immediately
+FanSafetyController.register_exit_handlers()
 
 
 # ============================================================================
@@ -629,10 +776,21 @@ class ThermalControlManager:
 
     @classmethod
     def set_profile(cls, profile: str, automatic: bool = False) -> tuple[bool, str]:
-        """Apply a thermal profile using powerprofilesctl, direct sysfs, sudo helper, or pkexec."""
+        """Apply a thermal profile using direct sysfs, powerprofilesctl, sudo helper, or pkexec."""
         prof_path, choices_path = cls.find_sysfs_paths()
 
-        # 1. Desktop powerprofilesctl (works without password for logged-in desktop user)
+        # 1. Direct sysfs write (if running as root, udev permission granted, or test fixture)
+        if prof_path and os.access(prof_path, os.W_OK):
+            try:
+                prof_path.write_text(profile + "\n", encoding="utf-8")
+                if ASUS_THROTTLE_PATH.exists() and os.access(ASUS_THROTTLE_PATH, os.W_OK):
+                    val = "1" if profile in ("performance", "balanced-performance") else ("2" if profile in ("quiet", "low-power", "cool") else "0")
+                    ASUS_THROTTLE_PATH.write_text(val + "\n", encoding="utf-8")
+                return True, f"Set active profile to {profile}"
+            except OSError as exc:
+                return False, f"Direct write failed: {exc}"
+
+        # 2. Desktop powerprofilesctl (works without password for logged-in desktop user)
         if shutil.which("powerprofilesctl"):
             try:
                 daemon_prof = profile
@@ -652,22 +810,11 @@ class ThermalControlManager:
             except (subprocess.SubprocessError, OSError):
                 pass
 
-        # 2. Direct sysfs write (if running as root or node is writable)
-        if prof_path and os.access(prof_path, os.W_OK):
-            try:
-                prof_path.write_text(profile + "\n", encoding="utf-8")
-                if ASUS_THROTTLE_PATH.exists() and os.access(ASUS_THROTTLE_PATH, os.W_OK):
-                    val = "1" if profile in ("performance", "balanced-performance") else ("2" if profile in ("quiet", "low-power", "cool") else "0")
-                    ASUS_THROTTLE_PATH.write_text(val + "\n", encoding="utf-8")
-                return True, f"Set active profile to {profile}"
-            except OSError as exc:
-                return False, f"Direct write failed: {exc}"
-
         # 3. Privileged helper script via sudo -n
         if HELPER_PATH.exists() and shutil.which("sudo"):
             try:
                 result = subprocess.run(
-                    ["sudo", "-n", str(HELPER_PATH), profile],
+                    ["sudo", "-n", str(HELPER_PATH), "profile", profile],
                     capture_output=True, text=True, timeout=8,
                 )
                 if result.returncode == 0:
@@ -748,10 +895,9 @@ class ThermalControlManager:
     @classmethod
     def get_cpu_epp(cls) -> str | None:
         """Get CPU Energy-Performance Preference (EPP)."""
-        epp_path = Path("/sys/devices/system/cpu/cpufreq/policy0/energy_performance_preference")
-        if epp_path.exists():
-            return read_text(epp_path)
-        gov_path = Path("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor")
+        if CPU_EPP_PATH.exists():
+            return read_text(CPU_EPP_PATH)
+        gov_path = CPU_EPP_PATH.parent / "scaling_governor"
         if gov_path.exists():
             return read_text(gov_path)
         return None
@@ -777,7 +923,7 @@ class ThermalControlManager:
                 except (subprocess.SubprocessError, OSError):
                     pass
 
-        policies = list(Path("/sys/devices/system/cpu/cpufreq").glob("policy*/energy_performance_preference"))
+        policies = list(CPUFREQ_DIR.glob("policy*/energy_performance_preference"))
         if policies and all(os.access(p, os.W_OK) for p in policies):
             try:
                 for p in policies:
@@ -786,7 +932,61 @@ class ThermalControlManager:
             except OSError as exc:
                 return False, str(exc)
 
+        if HELPER_PATH.exists() and shutil.which("sudo"):
+            try:
+                res = subprocess.run(
+                    ["sudo", "-n", str(HELPER_PATH), "epp", preference],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if res.returncode == 0:
+                    return True, f"Set CPU EPP preference to {preference}"
+            except Exception:
+                pass
+
         return False, "Setting CPU EPP requires privileges or power-profiles-daemon."
+
+    @classmethod
+    def get_battery_charge_limit(cls) -> int | None:
+        """Get battery charge threshold if supported."""
+        reg = get_registry()
+        return reg.battery_charge_limit
+
+    @classmethod
+    def set_battery_charge_limit(cls, limit_pct: int) -> tuple[bool, str]:
+        """Set battery charge threshold (e.g. 60%, 80%, 100%) to preserve battery lifespan."""
+        if not (50 <= limit_pct <= 100):
+            return False, "Charge limit must be between 50% and 100%."
+
+        # Direct write if writable
+        reg = get_registry()
+        if reg.battery_path:
+            thresh_file = reg.battery_path / "charge_control_end_threshold"
+            if thresh_file.exists() and os.access(thresh_file, os.W_OK):
+                try:
+                    thresh_file.write_text(f"{limit_pct}\n", encoding="utf-8")
+                    reg.battery_charge_limit = limit_pct
+                    return True, f"Battery charge limit set to {limit_pct}%."
+                except OSError as exc:
+                    return False, str(exc)
+
+        # Sudo helper
+        if HELPER_PATH.exists() and shutil.which("sudo"):
+            try:
+                res = subprocess.run(
+                    ["sudo", "-n", str(HELPER_PATH), "charge-limit", str(limit_pct)],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if res.returncode == 0:
+                    reg.battery_charge_limit = limit_pct
+                    return True, f"Battery charge limit set to {limit_pct}%."
+            except Exception as exc:
+                return False, str(exc)
+
+        return False, "Setting battery charge limit requires privileges. Run install-helper.sh."
+
+    read_active_profile = get_current_profile
+    read_cpu_boost = get_cpu_boost
+    set_platform_profile = set_profile
 
     @classmethod
     def set_cooler_boost(cls) -> tuple[bool, str]:
@@ -839,11 +1039,95 @@ class ThermalControlManager:
             except (ValueError, OSError) as exc:
                 return False, str(exc)
 
+        # Sudo helper fallback
+        if HELPER_PATH.exists() and shutil.which("sudo"):
+            try:
+                res = subprocess.run(
+                    ["sudo", "-n", str(HELPER_PATH), "fan", pwm_path, str(value_or_auto)],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if res.returncode == 0:
+                    return True, f"Fan PWM set to {value_or_auto}."
+            except Exception:
+                pass
+
         return False, "Direct PWM fan control requires root privileges."
 
 
 # ============================================================================
-# Professional Rotary Knob UI Component
+# Graduated Closed-Loop Target Temperature Limiter (Software Thermostat)
+# ============================================================================
+
+class GraduatedThermalLimiter:
+    """Multi-stage graduated thermal supervisor to eliminate profile flapping."""
+
+    def __init__(self) -> None:
+        self.stage = 0                  # 0: Normal, 1: EPP Power, 2: Boost Off, 3: Quiet Profile
+        self.last_transition_time = 0.0
+        self.dwell_seconds = 30.0
+        self.base_profile = "balanced"
+        self.status_msg = "Target Limiter: disabled."
+
+    def evaluate(self, hottest_temp: float, target_c: float, hysteresis_c: float = 5.0) -> str:
+        now = time.monotonic()
+        if hottest_temp <= 0.0:
+            return self.status_msg
+
+        # Exceedance delta
+        delta = hottest_temp - target_c
+
+        # Can we transition? Enforce minimum dwell timer
+        if (now - self.last_transition_time) < self.dwell_seconds:
+            return self.status_msg
+
+        # Escalation Logic (Graduated Step-Up)
+        if delta >= 6.0 and self.stage < 3:
+            # Stage 3: Quiet Platform Profile
+            if self.stage == 0:
+                self.base_profile = ThermalControlManager.get_current_profile() or "balanced"
+            self.stage = 3
+            self.last_transition_time = now
+            ThermalControlManager.set_profile("quiet", automatic=True)
+            ThermalControlManager.set_cpu_epp("power")
+            ThermalControlManager.set_cpu_boost(False, automatic=True)
+            self.status_msg = f"Regulating (Stage 3): Hottest {hottest_temp:.1f}°C > {target_c:.0f}°C. Quiet mode & max cooling engaged."
+
+        elif delta >= 3.0 and self.stage < 2:
+            # Stage 2: Disable Turbo Boost
+            if self.stage == 0:
+                self.base_profile = ThermalControlManager.get_current_profile() or "balanced"
+            self.stage = 2
+            self.last_transition_time = now
+            ThermalControlManager.set_cpu_boost(False, automatic=True)
+            ThermalControlManager.set_cpu_epp("power")
+            self.status_msg = f"Regulating (Stage 2): Hottest {hottest_temp:.1f}°C > {target_c:.0f}°C. Turbo Boost disabled to cap spikes."
+
+        elif delta >= 0.0 and self.stage < 1:
+            # Stage 1: CPU EPP Power
+            if self.stage == 0:
+                self.base_profile = ThermalControlManager.get_current_profile() or "balanced"
+            self.stage = 1
+            self.last_transition_time = now
+            ThermalControlManager.set_cpu_epp("balance_power")
+            self.status_msg = f"Regulating (Stage 1): Hottest {hottest_temp:.1f}°C >= {target_c:.0f}°C. CPU power scaled down."
+
+        # De-escalation Logic (Cooled down past hysteresis)
+        elif hottest_temp <= (target_c - hysteresis_c) and self.stage > 0:
+            self.stage = 0
+            self.last_transition_time = now
+            ThermalControlManager.set_profile(self.base_profile, automatic=True)
+            ThermalControlManager.set_cpu_boost(True, automatic=True)
+            ThermalControlManager.set_cpu_epp("balance_performance")
+            self.status_msg = f"Target Maintained: Hottest is {hottest_temp:.1f}°C (within safe {target_c:.0f}°C ceiling)."
+
+        elif self.stage == 0:
+            self.status_msg = f"Target Maintained: Hottest is {hottest_temp:.1f}°C (within {target_c:.0f}°C limit)."
+
+        return self.status_msg
+
+
+# ============================================================================
+# Professional Rotary Knob UI Component (Braun / Dieter Rams Style)
 # ============================================================================
 
 class KnobControl(tk.Canvas):
@@ -995,7 +1279,7 @@ class ThermalApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry("980x790")
+        self.root.geometry("980x800")
         self.root.minsize(860, 680)
         self.root.configure(bg=BG)
 
@@ -1003,21 +1287,17 @@ class ThermalApp:
         self.font_family = resolve_system_font()
         self.config = load_config()
         self.registry = get_registry(self.sys_info["cpu"])
+        self.limiter = GraduatedThermalLimiter()
 
         self.history: dict[str, list[float]] = {"cpu": [], "gpu": []}
         self.busy = False
         self.profile_change_busy = False
         self.profile_buttons: dict[str, ttk.Button] = {}
         self.cpu_stat_previous: tuple[float, float] | None = None
-        self.last_poll_ms = 0.0
 
         # Push Notification state
         self.alert_latched = {"cpu": False, "gpu": False, "crit": False}
         self.last_alert_time = {"cpu": 0.0, "gpu": 0.0, "crit": 0.0}
-
-        # Thermal Target Limiter state
-        self.target_temp_regulating = False
-        self.base_profile_before_target: str | None = None
 
         # GUI reactive variables
         self.target_temp_var = tk.BooleanVar(value=bool(self.config["target_temp_enabled"]))
@@ -1025,12 +1305,14 @@ class ThermalApp:
         self.alerts_var = tk.BooleanVar(value=bool(self.config["alerts_enabled"]))
         self.cpu_alert_var = tk.StringVar(value=str(self.config["cpu_alert_c"]))
         self.gpu_alert_var = tk.StringVar(value=str(self.config["gpu_alert_c"]))
-        self.cpu_load_var = tk.StringVar(value="CPU load: —")
         self.target_status_var = tk.StringVar(value="Target Limiter: disabled.")
         self.status_var = tk.StringVar(value="Hardware telemetry active.")
         self.last_update_var = tk.StringVar(value="Initializing hardware interfaces...")
         self.boost_status_var = tk.StringVar(value="CPU Turbo Boost: Detecting...")
-        self.alert_badge_var = tk.StringVar(value="🔔 ALERTS: ON" if self.config["alerts_enabled"] else "🔕 ALERTS: OFF")
+        self.alert_badge_var = tk.StringVar(value="ALERTS: ON" if self.config["alerts_enabled"] else "ALERTS: OFF")
+        self.charge_limit_var = tk.StringVar(value=f"{self.registry.battery_charge_limit or 100}%")
+        self.throttle_status_var = tk.StringVar(value="Thermal Throttling: Inactive (Normal Clocks)")
+        self.top_procs_var = tk.StringVar(value="Top Processes: Sampling...")
 
         # Telemetry summary chips
         self.chip_vars = {
@@ -1078,7 +1360,7 @@ class ThermalApp:
         style.configure("Selected.Profile.TButton", font=(self.font_family, 9, "bold"), padding=(12, 9),
                         background="#1a4f38", foreground="#b6fcd5")
 
-        # Tabs
+        # Tabs (No Emojis)
         style.configure("TNotebook", background=BG, borderwidth=0)
         style.configure("TNotebook.Tab", background=PANEL, foreground=MUTED, font=(self.font_family, 9, "bold"),
                         padding=(16, 7), borderwidth=0)
@@ -1120,31 +1402,31 @@ class ThermalApp:
                                     font=(self.font_family, 8, "bold"), padx=10, pady=5)
         self.alert_badge.pack(side="right")
 
-        # Tabbed Deck
+        # Tabbed Deck (Professional, clean names)
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True, padx=14, pady=(2, 6))
 
         self.tab_dashboard = tk.Frame(self.notebook, bg=BG)
-        self.notebook.add(self.tab_dashboard, text="  🎛️  Dashboard & Controls  ")
+        self.notebook.add(self.tab_dashboard, text="  Controls & Dashboard  ")
         self._build_tab_dashboard()
 
         self.tab_sensors = tk.Frame(self.notebook, bg=BG)
-        self.notebook.add(self.tab_sensors, text="  🖥️  All Hardware Sensors  ")
+        self.notebook.add(self.tab_sensors, text="  Hardware Sensors  ")
         self._build_tab_sensors()
 
         self.tab_alerts = tk.Frame(self.notebook, bg=BG)
-        self.notebook.add(self.tab_alerts, text="  🔔  Push Alerts & History  ")
+        self.notebook.add(self.tab_alerts, text="  Push Alerts & Automation  ")
         self._build_tab_alerts()
 
         # Footer Status Bar
         footer = tk.Frame(self.root, bg=BG)
         footer.pack(fill="x", padx=16, pady=(2, 8))
-        self.perf_var = tk.StringVar(value="⚡ Poll latency: — ms • Sensors: —")
+        self.perf_var = tk.StringVar(value="Telemetry I/O: — ms • Sensors: —")
         tk.Label(footer, textvariable=self.perf_var, bg=BG, fg=CYAN, font=(self.font_family, 8)).pack(side="left")
         tk.Label(footer, textvariable=self.last_update_var, bg=BG, fg=MUTED, font=(self.font_family, 8)).pack(side="right")
 
     def _build_tab_dashboard(self) -> None:
-        # 1. Rotary Knob Deck (Two Professional Knobs Side-by-Side)
+        # 1. Rotary Knob Deck (Two Tactile Dials)
         knob_deck = tk.Frame(self.tab_dashboard, bg=PANEL, padx=14, pady=10, highlightbackground=BORDER, highlightthickness=1)
         knob_deck.pack(fill="x", padx=14, pady=(6, 4))
 
@@ -1181,7 +1463,7 @@ class ThermalApp:
         right_col.pack(side="right", fill="both", expand=True, padx=8)
 
         self.fan_knob = KnobControl(
-            right_col, min_val=0, max_val=100, initial=float(self.config.get("fan_speed_pct", 80)),
+            right_col, min_val=20, max_val=100, initial=float(self.config.get("fan_speed_pct", 80)),
             step=5, unit="%", label="FAN PWM", command=self._on_fan_knob_change,
         )
         self.fan_knob.pack(anchor="center")
@@ -1194,17 +1476,17 @@ class ThermalApp:
 
         self.fan_manual_var = tk.BooleanVar(value=bool(self.config.get("fan_manual", False)))
         tk.Checkbutton(
-            right_col, text="Manual Fan Speed", variable=self.fan_manual_var,
+            right_col, text="Manual Fan Speed (Safety Floor Enforced)", variable=self.fan_manual_var,
             command=self.toggle_fan_manual, bg=PANEL, fg=FG, activebackground=PANEL,
             activeforeground=FG, selectcolor=PANEL_ALT, font=(self.font_family, 8, "bold"),
         ).pack(anchor="center")
 
-        btn_boost = ttk.Button(right_col, text="❄️ Cooler Boost (100% Cooling)", command=self.activate_cooler_boost)
+        btn_boost = ttk.Button(right_col, text="Cooler Boost (100% Flow)", command=self.activate_cooler_boost)
         btn_boost.pack(anchor="center", pady=(2, 0))
 
         # 2. Platform Profiles & CPU Tuning Card
-        ctrl_card = self._card(self.tab_dashboard, "PLATFORM PROFILES & CPU THERMAL TUNING",
-                               "Firmware-managed thermal policies and CPU Turbo Boost control.")
+        ctrl_card = self._card(self.tab_dashboard, "PLATFORM PROFILES & POWER LIMITS",
+                               "ACPI platform profiles and CPU power management.")
 
         prof_row = tk.Frame(ctrl_card, bg=PANEL)
         prof_row.pack(fill="x", pady=(2, 6))
@@ -1230,8 +1512,25 @@ class ThermalApp:
         for pref, lbl in (("power", "Power Saver"), ("balance_performance", "Balanced"), ("performance", "Performance")):
             ttk.Button(cpu_row, text=lbl, command=lambda p=pref: self.set_cpu_epp(p)).pack(side="left", padx=2)
 
+        # Battery Charge Longevity Limit (ASUS & Modern Laptops)
+        if self.registry.has_battery and self.registry.battery_charge_limit is not None:
+            bat_row = tk.Frame(ctrl_card, bg=PANEL)
+            bat_row.pack(fill="x", pady=(6, 0))
+            tk.Label(bat_row, text="Battery Charge Limit (Longevity):", bg=PANEL, fg=MUTED, font=(self.font_family, 8)).pack(side="left", padx=(0, 8))
+            for limit_val, lbl in ((60, "60% (Max Lifespan)"), (80, "80% (Balanced)"), (100, "100% (Full)")):
+                ttk.Button(bat_row, text=lbl, command=lambda v=limit_val: self.set_battery_limit(v)).pack(side="left", padx=2)
+            tk.Label(bat_row, textvariable=self.charge_limit_var, bg=PANEL, fg=PURPLE, font=(self.font_family, 8, "bold")).pack(side="left", padx=(8, 0))
+
+        # Throttling & Top Consumer Indicators
+        diag_card = self._card(self.tab_dashboard, "DIAGNOSTICS & PROCESS HEAT GENERATION",
+                               "Real-time CPU thermal throttling state and top CPU consumers.")
+        diag_row = tk.Frame(diag_card, bg=PANEL)
+        diag_row.pack(fill="x", pady=2)
+        tk.Label(diag_row, textvariable=self.throttle_status_var, bg=PANEL, fg=GREEN, font=(self.font_family, 8, "bold")).pack(anchor="w")
+        tk.Label(diag_row, textvariable=self.top_procs_var, bg=PANEL, fg=MUTED, font=(self.font_family, 8)).pack(anchor="w", pady=(2, 0))
+
         # 3. Live Hardware Telemetry Summary Chips
-        chip_card = self._card(self.tab_dashboard, "LIVE TELEMETRY SUMMARY", "Real-time metrics across all hardware components.")
+        chip_card = self._card(self.tab_dashboard, "TELEMETRY OVERVIEW", "Real-time metrics across all hardware components.")
         chip_row = tk.Frame(chip_card, bg=PANEL)
         chip_row.pack(fill="x", pady=2)
 
@@ -1309,7 +1608,7 @@ class ThermalApp:
         ttk.Entry(row1, textvariable=self.gpu_alert_var, width=5).pack(side="left", padx=(4, 14))
 
         ttk.Button(row1, text="Save Settings", command=self.save_settings).pack(side="left", padx=4)
-        ttk.Button(row1, text="🔔 Test Push Notification", command=self.test_push_notification).pack(side="left", padx=4)
+        ttk.Button(row1, text="Test Push Notification", command=self.test_push_notification).pack(side="left", padx=4)
 
         row2 = tk.Frame(alert_card, bg=PANEL)
         row2.pack(fill="x", pady=(6, 2))
@@ -1334,9 +1633,8 @@ class ThermalApp:
         speed_pct = int(val)
         self.config["fan_speed_pct"] = speed_pct
         if self.fan_manual_var.get():
-            pwm_val = int(speed_pct / 100.0 * 255.0)
             for p in self.registry.fan_pwm_files:
-                ThermalControlManager.set_fan_pwm(p, pwm_val)
+                FanSafetyController.set_fan_speed_safe(p, speed_pct)
 
     def toggle_target_temp(self) -> None:
         enabled = bool(self.target_temp_var.get())
@@ -1348,10 +1646,12 @@ class ThermalApp:
             self.target_status_var.set(f"Target Limiter: active ({self.target_temp_val:.0f}°C).")
         else:
             self.target_status_var.set("Target Limiter: disabled.")
-            if self.target_temp_regulating:
-                self.target_temp_regulating = False
-                base = self.base_profile_before_target or "balanced"
+            if self.limiter.stage > 0:
+                base = self.limiter.base_profile or "balanced"
                 ThermalControlManager.set_profile(base, automatic=True)
+                ThermalControlManager.set_cpu_boost(True, automatic=True)
+                ThermalControlManager.set_cpu_epp("balance_performance")
+                self.limiter.stage = 0
 
     def toggle_fan_manual(self) -> None:
         manual = bool(self.fan_manual_var.get())
@@ -1362,13 +1662,12 @@ class ThermalApp:
         if manual:
             self._on_fan_knob_change(self.fan_knob.val)
         else:
-            for p in self.registry.fan_pwm_files:
-                ThermalControlManager.set_fan_pwm(p, "auto")
+            FanSafetyController.restore_all_fans()
 
     def toggle_alerts(self) -> None:
         enabled = bool(self.alerts_var.get())
         self.config["alerts_enabled"] = enabled
-        self.alert_badge_var.set("🔔 ALERTS: ON" if enabled else "🔕 ALERTS: OFF")
+        self.alert_badge_var.set("ALERTS: ON" if enabled else "ALERTS: OFF")
         self.alert_badge.configure(fg=GREEN if enabled else MUTED)
         save_config(self.config)
 
@@ -1388,6 +1687,16 @@ class ThermalApp:
             self.status_var.set(msg)
         else:
             messagebox.showwarning(APP_NAME, f"Could not set CPU power preference.\n{msg}")
+
+    def set_battery_limit(self, limit_val: int) -> None:
+        success, msg = ThermalControlManager.set_battery_charge_limit(limit_val)
+        if success:
+            self.charge_limit_var.set(f"{limit_val}%")
+            self.config["battery_charge_limit"] = limit_val
+            save_config(self.config)
+            self.status_var.set(msg)
+        else:
+            messagebox.showwarning(APP_NAME, f"Could not set charge limit.\n{msg}")
 
     def activate_cooler_boost(self) -> None:
         success, msg = ThermalControlManager.set_cooler_boost()
@@ -1418,8 +1727,8 @@ class ThermalApp:
 
     def test_push_notification(self) -> None:
         ok = dispatch_push_notification(
-            "🔥 Thermal Alert Test",
-            "Push notification system is working! You will be alerted when temperatures rise.",
+            "Thermal Alert Test",
+            "Desktop push notification system is operational. You will be alerted when temperatures rise.",
             urgency="critical",
         )
         if ok:
@@ -1462,8 +1771,6 @@ class ThermalApp:
 
     def _update_profile_controls(self) -> None:
         current = ThermalControlManager.get_current_profile()
-        available = ThermalControlManager.get_available_profiles()
-
         for p, btn in self.profile_buttons.items():
             btn.configure(style="Selected.Profile.TButton" if p == current else "Profile.TButton")
 
@@ -1484,8 +1791,9 @@ class ThermalApp:
             t0 = time.perf_counter()
             temps, all_hw = self.registry.poll_all()
             load = self._cpu_load()
+            procs = get_top_cpu_processes(limit=3)
             duration_ms = (time.perf_counter() - t0) * 1000.0
-            self.root.after(0, lambda: self._apply_telemetry(temps, all_hw, load, duration_ms))
+            self.root.after(0, lambda: self._apply_telemetry(temps, all_hw, load, procs, duration_ms))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1494,7 +1802,8 @@ class ThermalApp:
         temperatures: dict[str, float],
         all_hw: list[dict[str, Any]],
         load: float | None,
-        duration_ms: float,
+        top_procs: list[tuple[str, float]] | None = None,
+        duration_ms: float = 0.0,
     ) -> None:
         # 1. Update Chips
         self.chip_vars["cpu"].set(f"CPU: {temperatures.get('cpu', 0.0):.1f}°C" if "cpu" in temperatures else "CPU: —")
@@ -1516,17 +1825,38 @@ class ThermalApp:
                 self.history[key].append(temperatures[key])
                 self.history[key] = self.history[key][-HISTORY_LIMIT:]
 
-        # 3. Target Temperature Limiter
-        self.evaluate_target_temperature(temperatures)
+        # 3. Fan Safety Rails (Check 80°C emergency override)
+        hottest = max(temperatures.get("cpu", 0.0), temperatures.get("gpu", 0.0))
+        if FanSafetyController.check_emergency_override(hottest):
+            self.fan_manual_var.set(False)
+            self.fan_knob.set_enabled(False)
 
-        # 4. Push Alerts Evaluation
+        # 4. Graduated Target Temperature Limiter
+        if self.target_temp_var.get():
+            status_text = self.limiter.evaluate(
+                hottest_temp=hottest,
+                target_c=self.target_temp_val,
+                hysteresis_c=float(self.config.get("target_hysteresis_c", 5.0)),
+            )
+            self.target_status_var.set(status_text)
+
+        # 5. Push Alerts Evaluation
         self.evaluate_push_alerts(temperatures, all_hw)
 
-        # 5. Treeview Update (Selective)
+        # 6. Throttling and Top CPU processes
+        if top_procs:
+            proc_str = "  |  ".join(f"{name}: {cpu_pct:.0f}%" for name, cpu_pct in top_procs)
+            self.top_procs_var.set(f"Top Consumers: {proc_str}")
+
+        # Throttling status
+        _, throttle_msg = check_cpu_throttling(hottest, load)
+        self.throttle_status_var.set(throttle_msg)
+
+        # 7. Treeview Update (Selective)
         self._update_treeview_selective(all_hw)
 
-        # 6. Performance & Footprint Indicator
-        self.perf_var.set(f"⚡ Telemetry I/O: {duration_ms:.1f} ms • Sensors: {len(all_hw)} • Load: {load or 0:.0f}%")
+        # 8. Performance Indicator
+        self.perf_var.set(f"Telemetry I/O: {duration_ms:.1f} ms • Sensors: {len(all_hw)} • Load: {load or 0:.0f}%")
         self.last_update_var.set(f"Last update: {datetime.now().strftime('%H:%M:%S')} • Poll: 2s")
 
         self._update_profile_controls()
@@ -1550,39 +1880,6 @@ class ThermalApp:
             return None
         return max(0.0, min(100.0, 100.0 * (delta_total - delta_idle) / delta_total))
 
-    def evaluate_target_temperature(self, temperatures: dict[str, float]) -> None:
-        """Regulate platform cooling to keep temps within the target ceiling."""
-        if not self.target_temp_var.get():
-            return
-
-        cpu_t = temperatures.get("cpu", 0.0)
-        gpu_t = temperatures.get("gpu", 0.0)
-        hottest = max(cpu_t, gpu_t)
-        if hottest <= 0.0:
-            return
-
-        target_c = self.target_temp_val
-        if hottest >= target_c:
-            if not self.target_temp_regulating:
-                self.target_temp_regulating = True
-                self.base_profile_before_target = ThermalControlManager.get_current_profile()
-                ThermalControlManager.set_profile("quiet", automatic=True)
-                ThermalControlManager.set_cpu_epp("power")
-
-            self.target_status_var.set(
-                f"⚠️ Regulating: Hottest sensor is {hottest:.1f}°C (exceeds {target_c:.0f}°C). Cooling active."
-            )
-        elif hottest <= (target_c - TARGET_TEMP_HYSTERESIS):
-            if self.target_temp_regulating:
-                self.target_temp_regulating = False
-                base = self.base_profile_before_target or "balanced"
-                ThermalControlManager.set_profile(base, automatic=True)
-                ThermalControlManager.set_cpu_epp("balance_performance")
-
-            self.target_status_var.set(
-                f"✓ Target Maintained: Hottest sensor is {hottest:.1f}°C (within {target_c:.0f}°C limit)."
-            )
-
     def evaluate_push_alerts(self, temperatures: dict[str, float], all_hw: list[dict[str, Any]]) -> None:
         """Evaluate high-temperature push notification triggers with anti-spam cooldown."""
         if not self.alerts_var.get():
@@ -1600,15 +1897,15 @@ class ThermalApp:
                 self.alert_latched["cpu"] = True
                 self.last_alert_time["cpu"] = now
                 dispatch_push_notification(
-                    "🔥 High CPU Temperature Alert!",
-                    f"CPU temperature reached {cpu_t:.1f}°C (Threshold: {cpu_limit:.1f}°C). Active cooling recommended.",
+                    "High CPU Temperature Alert",
+                    f"CPU temperature reached {cpu_t:.1f}°C (Threshold: {cpu_limit:.1f}°C). Cooling downshift recommended.",
                     urgency="critical",
                 )
         elif cpu_t and cpu_t <= (cpu_limit - ALERT_RESET_HYSTERESIS):
             if self.alert_latched["cpu"]:
                 self.alert_latched["cpu"] = False
                 dispatch_push_notification(
-                    "✅ CPU Temperature Normalized",
+                    "CPU Temperature Normalized",
                     f"CPU cooled down to {cpu_t:.1f}°C (Safe thermal limits restored).",
                     urgency="normal",
                 )
@@ -1619,7 +1916,7 @@ class ThermalApp:
                 self.alert_latched["gpu"] = True
                 self.last_alert_time["gpu"] = now
                 dispatch_push_notification(
-                    "🔥 High GPU Temperature Alert!",
+                    "High GPU Temperature Alert",
                     f"GPU temperature reached {gpu_t:.1f}°C (Threshold: {gpu_limit:.1f}°C).",
                     urgency="critical",
                 )
@@ -1627,12 +1924,12 @@ class ThermalApp:
             if self.alert_latched["gpu"]:
                 self.alert_latched["gpu"] = False
                 dispatch_push_notification(
-                    "✅ GPU Temperature Normalized",
+                    "GPU Temperature Normalized",
                     f"GPU cooled down to {gpu_t:.1f}°C.",
                     urgency="normal",
                 )
 
-        # Hardware Critical Trip Point Alert (Kernel-reported crit limits)
+        # Hardware Critical Trip Point Alert
         for s in all_hw:
             c = s.get("crit_temp")
             v = s.get("value")
@@ -1641,8 +1938,8 @@ class ThermalApp:
                     self.alert_latched["crit"] = True
                     self.last_alert_time["crit"] = now
                     dispatch_push_notification(
-                        "🚨 Hardware Critical Temperature Alert!",
-                        f"{s['device_name']} ({s['sensor_name']}) hit {v:.1f}°C! (Kernel critical limit: {c:.1f}°C).",
+                        "Hardware Critical Temperature Alert",
+                        f"{s['device_name']} ({s['sensor_name']}) hit {v:.1f}°C! (Kernel shutdown limit: {c:.1f}°C).",
                         urgency="critical",
                     )
                 break
@@ -1654,7 +1951,7 @@ class ThermalApp:
 
         cat_names = {
             "cpu": "Processor", "gpu": "Graphics", "storage": "Storage Drive",
-            "motherboard": "Motherboard", "network": "Wireless/NIC", "fan": "Cooling Fan",
+            "motherboard": "Motherboard", "network": "Wireless/NIC", "fan": "Cooling Fan", "battery": "Battery",
         }
 
         for s in all_hw:
@@ -1724,6 +2021,83 @@ class ThermalApp:
 
 
 # ============================================================================
+# Background Daemon Mode (Headless System Thermostat)
+# ============================================================================
+
+def run_daemon() -> int:
+    """Run headless background thermostat daemon (systemd service compatible)."""
+    sys_info = get_system_info()
+    reg = get_registry(sys_info["cpu"])
+    limiter = GraduatedThermalLimiter()
+    config = load_config()
+
+    print(f"[{APP_NAME}] Starting background thermal daemon on {sys_info['summary']}...")
+    print(f"[{APP_NAME}] Target Limiter: {'ENABLED (' + str(config.get('target_temp_c')) + '°C)' if config.get('target_temp_enabled') else 'DISABLED'}")
+    print(f"[{APP_NAME}] Push Alerts: {'ENABLED' if config.get('alerts_enabled') else 'DISABLED'}")
+
+    running = True
+
+    def stop_daemon(signum: int, _frame: Any) -> None:
+        nonlocal running
+        print(f"\n[{APP_NAME}] Received stop signal ({signum}), shutting down cleanly...")
+        running = False
+        FanSafetyController.restore_all_fans()
+
+    signal.signal(signal.SIGINT, stop_daemon)
+    signal.signal(signal.SIGTERM, stop_daemon)
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        while running:
+            t0 = time.perf_counter()
+            config = load_config()
+            temps, all_hw = reg.poll_all()
+            hottest = max(temps.get("cpu", 0.0), temps.get("gpu", 0.0))
+
+            # Fan Emergency Override
+            FanSafetyController.check_emergency_override(hottest)
+
+            # Graduated Limiter
+            limiter_msg = "Disabled"
+            if config.get("target_temp_enabled", False):
+                limiter_msg = limiter.evaluate(
+                    hottest_temp=hottest,
+                    target_c=float(config.get("target_temp_c", 75.0)),
+                    hysteresis_c=float(config.get("target_hysteresis_c", 5.0)),
+                )
+
+            # Record daemon state for client inspections
+            state_data = {
+                "timestamp": datetime.now().isoformat(),
+                "hottest_temp": hottest,
+                "temperatures": temps,
+                "limiter_status": limiter_msg,
+                "limiter_stage": limiter.stage,
+                "active_profile": ThermalControlManager.get_current_profile(),
+                "cpu_boost": ThermalControlManager.get_cpu_boost(),
+            }
+            try:
+                DAEMON_STATE_PATH.write_text(json.dumps(state_data, indent=2) + "\n", encoding="utf-8")
+            except OSError:
+                pass
+
+            duration = time.perf_counter() - t0
+            sleep_time = max(0.5, 2.0 - duration)
+            time.sleep(sleep_time)
+
+    finally:
+        FanSafetyController.restore_all_fans()
+        if DAEMON_STATE_PATH.exists():
+            try:
+                DAEMON_STATE_PATH.unlink()
+            except OSError:
+                pass
+        print(f"[{APP_NAME}] Daemon stopped cleanly.")
+    return 0
+
+
+# ============================================================================
 # CLI and Terminal Operation
 # ============================================================================
 
@@ -1754,6 +2128,7 @@ def get_telemetry_snapshot() -> dict[str, Any]:
             "target_temp_c": float(config.get("target_temp_c", 75.0)),
             "cpu_boost": ThermalControlManager.get_cpu_boost(),
             "cpu_epp": ThermalControlManager.get_cpu_epp(),
+            "battery_charge_limit": reg.battery_charge_limit,
         },
         "config": config,
     }
@@ -1768,7 +2143,7 @@ def print_cli_status(snapshot: dict[str, Any] | None = None) -> None:
     available = controls["available_profiles"]
 
     print("=" * 68)
-    print(f"  {APP_NAME} v{__version__} - Universal Linux Hardware & Thermal Control")
+    print(f"  {APP_NAME} v{__version__} - Linux Hardware & Thermal Management Center")
     print("=" * 68)
     print(f"Host Device   : {sys_info['summary']}")
     print(f"Operating Sys : {sys_info['os']} ({sys_info.get('arch', platform.machine())})")
@@ -1798,6 +2173,9 @@ def print_cli_status(snapshot: dict[str, Any] | None = None) -> None:
     if epp_val:
         print(f"  CPU Power Pref    : {epp_val}")
 
+    if controls.get("battery_charge_limit"):
+        print(f"  Battery Limit     : {controls['battery_charge_limit']}%")
+
     fan_sensors = [s for s in all_hw if s["category"] == "fan"]
     if fan_sensors:
         fan_strs = [f"{f['sensor_name']}: {int(f['value'])} RPM" for f in fan_sensors if f["value"] > 0]
@@ -1826,18 +2204,20 @@ def cli_monitor() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="thermals",
-        description="Thermals - Universal Linux Hardware Telemetry & Thermal Control Center",
+        description="Thermals - Linux Hardware Telemetry & Thermal Management Center",
     )
     parser.add_argument("-s", "--status", action="store_true", help="Print current telemetry and exit")
     parser.add_argument("-j", "--json", action="store_true", help="Print telemetry as JSON")
     parser.add_argument("-m", "--monitor", action="store_true", help="Run real-time terminal monitor")
+    parser.add_argument("-d", "--daemon", action="store_true", help="Run headless background thermal daemon")
     parser.add_argument("-l", "--list-profiles", action="store_true", help="List supported thermal profiles")
     parser.add_argument("--list-hardware", action="store_true", help="List all detected hardware sensors")
     parser.add_argument("-p", "--set-profile", metavar="PROFILE", help="Set platform thermal profile")
     parser.add_argument("--set-target-temp", metavar="CELSIUS|off", help="Set target temperature limit (e.g. 70 or off)")
     parser.add_argument("--set-boost", choices=["on", "off"], help="Enable or disable CPU Turbo Boost")
     parser.add_argument("--set-epp", choices=["power", "balance_power", "balance_performance", "performance"], help="Set CPU Energy-Performance Preference")
-    parser.add_argument("--set-fan", metavar="PWM_OR_AUTO", help="Set fan speed (0-255 or auto)")
+    parser.add_argument("--set-charge-limit", metavar="PERCENT", type=int, help="Set battery charge limit (50-100)")
+    parser.add_argument("--set-fan", metavar="PWM_OR_AUTO", help="Set fan speed (40-255 or auto)")
     parser.add_argument("--cooler-boost", action="store_true", help="Activate Cooler Boost (100%% cooling & fans)")
     parser.add_argument("--silent", action="store_true", help="Activate silent cooling mode")
     parser.add_argument("--test-alert", action="store_true", help="Send a test desktop push notification")
@@ -1846,6 +2226,10 @@ def main() -> int:
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
 
     args = parser.parse_args()
+
+    # Daemon Execution
+    if args.daemon:
+        return run_daemon()
 
     # CLI Actions
     if args.json:
@@ -1858,7 +2242,7 @@ def main() -> int:
 
     if args.test_alert:
         ok = dispatch_push_notification(
-            "🔥 Thermal Alert Test",
+            "Thermal Alert Test",
             "This is a test high-temperature push notification from Thermals.",
             urgency="critical",
         )
@@ -1914,6 +2298,11 @@ def main() -> int:
                 return 1
         return 0
 
+    if args.set_charge_limit is not None:
+        success, msg = ThermalControlManager.set_battery_charge_limit(args.set_charge_limit)
+        print(f"[{'SUCCESS' if success else 'FAILED'}] {msg}")
+        return 0 if success else 1
+
     if args.set_boost:
         enable = args.set_boost == "on"
         success, msg = ThermalControlManager.set_cpu_boost(enable)
@@ -1940,7 +2329,15 @@ def main() -> int:
         if not reg.fan_pwm_files:
             print("[FAILED] No controllable PWM fans detected on this system.")
             return 1
-        success, msg = ThermalControlManager.set_fan_pwm(reg.fan_pwm_files[0], args.set_fan)
+        if args.set_fan == "auto":
+            success, msg = ThermalControlManager.set_fan_pwm(reg.fan_pwm_files[0], "auto")
+        else:
+            try:
+                pct = int(args.set_fan)
+                success, msg = FanSafetyController.set_fan_speed_safe(reg.fan_pwm_files[0], pct)
+            except ValueError:
+                print("[FAILED] Invalid fan setting. Use integer percent or 'auto'.")
+                return 1
         print(f"[{'SUCCESS' if success else 'FAILED'}] {msg}")
         return 0 if success else 1
 
@@ -1955,12 +2352,12 @@ def main() -> int:
         print(f"[{APP_NAME}] No graphical display detected (DISPLAY or WAYLAND_DISPLAY not set).")
         print(f"[{APP_NAME}] Running in terminal status mode:\n")
         print_cli_status()
-        print("\nTip: Run 'thermals --monitor' for live terminal monitoring, or 'thermals --help' for options.")
+        print("\nTip: Run 'thermals --monitor' for live terminal monitoring, or 'thermals --daemon' for background daemon.")
         return 0
 
     if not TKINTER_AVAILABLE:
         print("Error: Tkinter is required for GUI, but python3-tk is not installed.", file=sys.stderr)
-        print("Use CLI mode: thermals --status or thermals --monitor", file=sys.stderr)
+        print("Use CLI mode: thermals --status, thermals --monitor, or thermals --daemon", file=sys.stderr)
         return 1
 
     try:

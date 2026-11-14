@@ -19,6 +19,8 @@ cp "$SCRIPT_DIR/asus-thermal-profile" "$TARBALL_DIR/"
 cp "$SCRIPT_DIR/install.sh" "$TARBALL_DIR/"
 cp "$SCRIPT_DIR/install-helper.sh" "$TARBALL_DIR/"
 cp "$SCRIPT_DIR/install-thermals.sh" "$TARBALL_DIR/"
+cp "$SCRIPT_DIR/thermals.service" "$TARBALL_DIR/"
+cp "$SCRIPT_DIR/SECURITY.md" "$TARBALL_DIR/"
 cp "$SCRIPT_DIR/run.sh" "$TARBALL_DIR/"
 cp "$SCRIPT_DIR/setup.py" "$TARBALL_DIR/"
 cp "$SCRIPT_DIR/pyproject.toml" "$TARBALL_DIR/"
@@ -42,6 +44,7 @@ mkdir -p \
   "$DEB_ROOT/usr/share/${PKG_NAME}" \
   "$DEB_ROOT/usr/share/applications" \
   "$DEB_ROOT/usr/share/icons/hicolor/scalable/apps" \
+  "$DEB_ROOT/usr/lib/systemd/user" \
   "$DEB_ROOT/usr/share/doc/${PKG_NAME}"
 
 cat > "$DEB_ROOT/DEBIAN/control" <<EOF
@@ -99,6 +102,10 @@ install -m 0755 "$SCRIPT_DIR/install-helper.sh" "$DEB_ROOT/usr/share/${PKG_NAME}
 
 if [[ -f "$SCRIPT_DIR/assets/thermals.svg" ]]; then
   install -m 0644 "$SCRIPT_DIR/assets/thermals.svg" "$DEB_ROOT/usr/share/icons/hicolor/scalable/apps/thermals.svg"
+fi
+
+if [[ -f "$SCRIPT_DIR/thermals.service" ]]; then
+  install -m 0644 "$SCRIPT_DIR/thermals.service" "$DEB_ROOT/usr/lib/systemd/user/thermals.service"
 fi
 
 cat > "$DEB_ROOT/usr/bin/thermals" <<'EOF'

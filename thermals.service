@@ -1,0 +1,16 @@
+[Unit]
+Description=Thermals - Linux Hardware Thermal & Battery Management Daemon
+Documentation=https://github.com/Yash55-max/asus-thermals-control
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env thermals --daemon
+Restart=on-failure
+RestartSec=5s
+
+# Failsafe cleanup: restore firmware fan curves on service stop
+ExecStopPost=-/usr/local/sbin/asus-thermal-profile restore-fans
+
+[Install]
+WantedBy=default.target

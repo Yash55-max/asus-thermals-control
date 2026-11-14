@@ -1,6 +1,6 @@
 [Unit]
 Description=Thermals - Linux Hardware Thermal & Battery Management Daemon
-Documentation=https://github.com/Yash55-max/asus-thermals-control
+Documentation=https://github.com/Yash55-max/thermals
 After=default.target
 
 [Service]

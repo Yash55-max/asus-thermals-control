@@ -1,6 +1,6 @@
 # Thermals
 
-[![CI](https://github.com/Yash55-max/asus-thermals-control/actions/workflows/ci.yml/badge.svg)](https://github.com/Yash55-max/asus-thermals-control/actions)
+[![CI](https://github.com/Yash55-max/thermals/actions/workflows/ci.yml/badge.svg)](https://github.com/Yash55-max/thermals/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Linux: All Major Distros](https://img.shields.io/badge/platform-Linux-orange.svg)](https://kernel.org)
@@ -65,8 +65,8 @@ Manual fan sliders without safeguards are hazardous to hardware. Thermals enforc
 ### Method 1: Universal Installer (Recommended)
 
 ```bash
-git clone https://github.com/Yash55-max/asus-thermals-control.git
-cd asus-thermals-control
+git clone https://github.com/Yash55-max/thermals.git
+cd thermals
 
 # Install dependencies (Debian/Ubuntu, Fedora, Arch, openSUSE)
 bash install.sh --install-deps

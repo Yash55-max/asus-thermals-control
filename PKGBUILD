@@ -4,7 +4,7 @@ pkgver=1.2.0
 pkgrel=1
 pkgdesc="Native Linux hardware telemetry monitor and platform profile manager"
 arch=('any')
-url="https://github.com/Yash55-max/asus-thermals-control"
+url="https://github.com/Yash55-max/thermals"
 license=('MIT')
 depends=('python>=3.8' 'tk' 'lm_sensors' 'libnotify')
 optdepends=(

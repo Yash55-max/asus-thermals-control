@@ -17,8 +17,8 @@ Thank you for your interest in contributing to **Thermals** (`asus-thermals-cont
 Clone the repository and install test dependencies:
 
 ```bash
-git clone https://github.com/Yash55-max/asus-thermals-control.git
-cd asus-thermals-control
+git clone https://github.com/Yash55-max/thermals.git
+cd thermals
 
 # Set up virtual environment
 python3 -m venv venv

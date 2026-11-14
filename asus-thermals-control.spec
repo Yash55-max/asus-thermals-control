@@ -3,7 +3,7 @@ Version:        1.2.0
 Release:        1%{?dist}
 Summary:        Native Linux hardware telemetry monitor and platform profile manager
 License:        MIT
-URL:            https://github.com/Yash55-max/asus-thermals-control
+URL:            https://github.com/Yash55-max/thermals
 Source0:        %{name}-%{version}.tar.gz
 BuildArch:      noarch
 

@@ -7,7 +7,7 @@ setup(
     description="Native Linux hardware telemetry monitor and platform profile manager",
     author="Yashwanth Ponnam",
     author_email="yashwanthponnam55@gmail.com",
-    url="https://github.com/Yash55-max/asus-thermals-control",
+    url="https://github.com/Yash55-max/thermals",
     license="MIT",
     py_modules=["app"],
     entry_points={

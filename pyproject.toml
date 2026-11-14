@@ -35,6 +35,6 @@ thermals = "app:main"
 asus-thermals-control = "app:main"
 
 [project.urls]
-Homepage = "https://github.com/Yash55-max/asus-thermals-control"
-Repository = "https://github.com/Yash55-max/asus-thermals-control.git"
-"Bug Tracker" = "https://github.com/Yash55-max/asus-thermals-control/issues"
+Homepage = "https://github.com/Yash55-max/thermals"
+Repository = "https://github.com/Yash55-max/thermals.git"
+"Bug Tracker" = "https://github.com/Yash55-max/thermals/issues"

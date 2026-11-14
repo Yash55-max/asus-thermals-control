@@ -56,7 +56,7 @@ Architecture: all
 Maintainer: Yashwanth Ponnam <yashwanthponnam55@gmail.com>
 Depends: python3 (>= 3.8), python3-tk, lm-sensors, libnotify-bin
 Suggests: policykit-1, power-profiles-daemon
-Homepage: https://github.com/Yash55-max/asus-thermals-control
+Homepage: https://github.com/Yash55-max/thermals
 Description: Native Linux thermal control center and platform profile manager
  Thermals is a native Linux desktop and CLI application for monitoring hardware
  temperatures (CPU, GPU, NVMe, ACPI) and managing firmware thermal profiles
